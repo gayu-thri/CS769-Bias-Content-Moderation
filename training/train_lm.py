@@ -126,6 +126,10 @@ def parse_args(argv=None):
                    help="repeat train rows mentioning AXIS (half toxic, half clean) until they are FRACTION of "
                         "train, e.g. disability=0.10; val and test are never changed")
     p.add_argument("--skip-baseline", action="store_true", help="do not score M0 before training")
+    p.add_argument("--baseline-only", action="store_true",
+                   help="score the untrained base model (M0) on val/test plus its counterfactual gaps, write the "
+                        "reports to --output-dir, and stop: no training. A later run can reuse these numbers with "
+                        "--skip-baseline --baseline-from <that folder>")
     p.add_argument("--baseline-from", default=None,
                    help="with --skip-baseline: copy M0's metrics from an earlier run's output folder (same data, "
                         "seed and sample sizes), so this run's tables and model card include M0")
@@ -1383,6 +1387,47 @@ paraphrase baseline. The project's bias result (Δ, which subtracts that baselin
 
 # ---------------------------------------------------------------- main
 
+def write_baseline_reports(args, out_dir, eval_frames, predictions, results, cf_results, frames, composition,
+                           prompt, dtype_name):
+    """--baseline-only: the untrained base model's reports, in the same files and summary keys a training
+    run writes, so the notebook's comparison reads them and a training run can reuse them
+    (--baseline-from)."""
+    import torch
+    import transformers
+
+    for s, frame in eval_frames.items():
+        keep = [c for c in ("id", "source", "axis", "label") if c in frame.columns]
+        table = frame[keep].copy()
+        table["p_toxic_m0"], table["option_mass_m0"] = predictions["M0"][s]
+        table.to_csv(out_dir / f"predictions_{s}.csv", index=False)
+    table = metrics_table(results)
+    table.to_csv(out_dir / "metrics.csv", index=False)
+    cf_table = pd.DataFrame([{"model": stage, "split": split, "axis": axis, **m}
+                             for stage, by_split in cf_results.items() for split, by_axis in by_split.items()
+                             for axis, m in by_axis.items()])
+    cf_table.to_csv(out_dir / "counterfactual.csv", index=False)
+    summary = {
+        "variant": "M0", "baseline_only": True, "base_model": args.base_model, "method": "none (untrained)",
+        "framework_type": "hf-causal-lm", "prompt": prompt.to_public_dict(), "dtype": dtype_name,
+        "output_dir": str(out_dir), "rows": {k: len(v) for k, v in frames.items()}, "axis_composition": composition,
+        "metrics": results, "counterfactual_metrics": cf_results, "collapse_warnings": [], "log_history": [],
+        "hyperparameters": {k: v for k, v in vars(args).items() if k != "hub_token_env"},
+        "environment": {"python": platform.python_version(), "torch": torch.__version__,
+                        "transformers": transformers.__version__,
+                        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None},
+    }
+    with open(out_dir / "training_summary.json", "w") as handle:
+        json.dump(summary, handle, indent=2, default=str)
+    shown = ["model", "split", "group", "n", "accuracy", "macro_f1", "auroc", "fpr", "fnr", "option_mass"]
+    with pd.option_context("display.width", 180, "display.max_rows", 200):
+        print("\n" + table[[c for c in shown if c in table.columns]].round(4).to_string(index=False))
+        if len(cf_table):
+            print("\nCounterfactual gap (raw, without the paraphrase baseline the bias framework adds):")
+            print(cf_table.round(4).to_string(index=False))
+    print(f"\nBaseline (untrained {args.base_model}) saved to {out_dir}. A training run with the same data, seed and "
+          f"sample sizes can reuse it: --skip-baseline --baseline-from {out_dir}")
+
+
 def main(argv=None):
     args = parse_args(argv)
     import torch
@@ -1400,10 +1445,15 @@ def main(argv=None):
     if dtype_name == "float16":
         print("NOTE: this GPU has no bfloat16 (e.g. a T4), so training runs in float16. An L4 or A100 is "
               "faster and numerically safer.")
-    args.method, args.optim = plan_method(args, dtype_name, token)
+    if args.baseline_only and args.skip_baseline:
+        raise SystemExit("--baseline-only scores M0; it cannot be combined with --skip-baseline")
+    if args.baseline_only:  # no training: no memory plan, optimizer or learning rate needed
+        args.method, args.optim = "none", None
+    else:
+        args.method, args.optim = plan_method(args, dtype_name, token)
     if args.lr is None:
         args.lr = 1e-5 if args.method == "full" else 2e-4
-    args.variant = args.variant or ("M4" if args.counterfactual else "M2")
+    args.variant = "M0" if args.baseline_only else (args.variant or ("M4" if args.counterfactual else "M2"))
     args.eval_batch_size = resolve_eval_batch_size(args.eval_batch_size, args.device)
 
     full = {"train": load_split(args.train), "val": load_split(args.val)}
@@ -1462,11 +1512,16 @@ def main(argv=None):
             print(f"M0 metrics copied from {args.baseline_from} (same base model, seed and evaluation rows)")
         else:
             print(f"NOTE: M0 metrics not copied from {args.baseline_from}: it has no finished run with the same base "
-                  "model, seed and evaluation rows")
-    if not args.skip_baseline:
+                  "model, seed and evaluation rows, so M0 is scored here")
+    if not args.skip_baseline or (args.baseline_from and "M0" not in results):
         print(f"\nScoring M0 ({args.base_model}) with the framework's LLM adapter ...")
         record("M0", framework_scores(args.base_model, prompt, task, to_score, args, dtype_name, token))
         print("M0 val: " + json.dumps({k: round(v, 4) for k, v in results["M0"]["val"]["overall"].items()}))
+
+    if args.baseline_only:
+        write_baseline_reports(args, out_dir, eval_frames, predictions, results, cf_results, frames, composition,
+                               prompt, dtype_name)
+        return {"baseline_only": True}
 
     model_dir = Path(args.stage_dir) / args.variant.lower() if args.stage_dir else out_dir
     info = train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir, gap_pairs=cf_eval.get("val"),

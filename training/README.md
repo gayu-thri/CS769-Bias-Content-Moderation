@@ -91,6 +91,14 @@ change if the run cannot fit. The method used is recorded in `training_summary.j
   then copied to Drive once, instead of being read back from Drive.
 - **GPU-sized scoring batches** (`--eval-batch-size auto`): 32 posts on GPUs with 40 GB or more.
 
+**Baseline only (untrained Qwen3-4B).** `train_lm.py --baseline-only --output-dir m0` scores M0 on val and test,
+with its error rates and counterfactual gaps, and stops without training. In the notebook, set
+`BASELINE_ONLY = True`. It writes the same files a training run does (`metrics.csv`,
+`counterfactual.csv`, `predictions_*.csv`, `training_summary.json`), so the comparison shows M0 on its own.
+Later training runs reuse it with `--skip-baseline --baseline-from m0`. If the data, seed or sample
+sizes differ, the training run scores M0 itself instead. Tested: the reused M0 numbers are identical to a
+fresh scoring.
+
 **Loss curves, live and final.**
 - **Live:** `--tensorboard-dir` logs to TensorBoard (one subfolder per run, e.g. `M2_2026-10-26_1530`). In
   the notebook, run section 3b before training: a TensorBoard panel opens and refreshes every 15 s.
