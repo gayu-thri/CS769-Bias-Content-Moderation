@@ -728,7 +728,8 @@ def make_gap_callback(pairs, render, tokenizer, chat, max_length, answer_ids, to
             if was_training:
                 model.train()
             self.history.append({"step": state.global_step, **{a: g for a, g in gaps.items()}})
-            print(f"step {state.global_step}/{state.max_steps} | val counterfactual gap: " + ", ".join(
+            label = f"step {state.global_step}/{state.max_steps}" if state.max_steps else "step 0 (before training)"
+            print(f"{label} | val counterfactual gap: " + ", ".join(
                 f"{a} {g['gap']:.4f} (direction {g['direction']:+.4f})" for a, g in gaps.items()), flush=True)
 
     return Gap()
