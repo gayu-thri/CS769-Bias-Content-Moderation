@@ -81,7 +81,7 @@ The script estimates memory from the model config before loading anything and st
 change if the run cannot fit. The method used is recorded in `training_summary.json`.
 
 **Training data size.** 20,000 of the ~45,600 training posts for one epoch (all disability posts kept).
-Posts average about 127 tokens with the prompt, so a run takes well under an hour.
+Posts average about 125 tokens with the prompt, so a run takes well under an hour.
 `MAX_TRAIN_SAMPLES = 0` uses everything.
 
 **Both bias categories are in the training data.** The framework tests gender and disability. About 77%

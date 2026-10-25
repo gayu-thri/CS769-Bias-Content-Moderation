@@ -5,29 +5,39 @@ Rebuilding it with that notebook gives the same files.
 
 | File | Rows | Use |
 |-|-|-|
-| `train.csv` | 45,605 | fine-tuning M2 / M4 |
-| `val.csv` | 6,515 | checkpoint selection |
-| `test.csv` | 13,030 | held out: never trained on; source of the bias-test posts |
-| `verification_300.csv` | 300 | test posts for LLM tagging and human/Gemini review (150 gender + 150 disability) |
-| `all_posts.csv` | 65,150 | every cleaned post with its split and source scores (ETHOS targets, Civil Comments `cc_toxicity`, `cc_identity_attack`, `cc_insult`, `cc_threat`). The training notebook uses it to skip counterfactual pairs on posts that attack a group |
-| `biascompare_gender_test.jsonl` | 4,623 | gender test posts in the old proof-of-concept format |
+| `train.csv` | 44,234 | fine-tuning M2 / M4 |
+| `val.csv` | 6,321 | checkpoint selection |
+| `test.csv` | 12,640 | held out: never trained on; source of the bias-test posts |
+| `verification_300.csv` | 300 | test posts for LLM tagging and human/Gemini review (150 gender: 77 male / 73 female, no mixed-gender posts; 150 disability) |
+| `all_posts.csv` | 63,195 | every cleaned post with its split and source scores (ETHOS targets, Civil Comments `cc_toxicity`, `cc_identity_attack`, `cc_insult`, `cc_threat`). The training notebook uses it to skip counterfactual pairs on posts that attack a group |
+| `biascompare_gender_test.jsonl` | 4,313 | gender test posts in the old proof-of-concept format |
 
 ## Sources and labels
 
 | Source | Rows kept | Label |
 |-|-|-|
-| Civil Comments (`google/civil_comments`, Borkan et al. 2019; CC0) | 65,791 sampled from 1.8M: 60k half toxic / half clean, plus every toxic disability-mentioning comment and as many clean ones | toxic if `toxicity ≥ 0.5` (at least half the crowd raters said toxic) |
+| Civil Comments (`google/civil_comments`, Borkan et al. 2019; CC0) | 64,118 sampled from 1.8M: 60k half toxic / half clean, plus every toxic disability-mentioning comment and as many clean ones | toxic if `toxicity > 0.5` (a strict majority of crowd raters); clean if `< 0.3`; the 159,651 comments in between (rater ties and near-ties) are dropped |
 | ETHOS (Mollas et al. 2020; GPL-3.0) | 998 | hate if `isHate ≥ 0.5` (5 annotators) |
 
-After cleaning and cross-source deduplication: 65,150 posts, 49.6% toxic. Each split has the same mix
-(stratified by source × label × category).
+**Cleaning**, in order:
+
+1. Unescape HTML entities and remove HTML tags.
+2. NFKC-normalize Unicode.
+3. Remove URLs; replace handles with `@user`.
+4. Drop posts that are under 4 words (1,610), over 2,000 characters, mostly non-letters (37) or
+   comment spam (18; earnings / work-from-home pitches, "fancy" Unicode lettering).
+5. Remove exact duplicates (218) and near-duplicates (37; same first 100 normalized characters), across
+   all sources before splitting, keeping the toxic copy.
+
+Result: 63,195 posts, 49.5% toxic. Each split has the same mix (stratified by source × label ×
+category), and no post or near-duplicate appears in two splits.
 
 | Category (lexicon tags) | Share of posts | Toxic |
 |-|-|-|
-| gender (incl. possessives like "women's") | 37.0% | 56% |
-| disability | 10.4% | 48% |
+| gender (incl. possessives like "women's") | 35.7% | 56% |
+| disability | 8.0% | 48% |
 
-Posts are short: median 38 words, about 127 tokens with the training prompt.
+Posts are short: median 35 words, about 125 tokens with the training prompt.
 
 ## Columns (`train/val/test.csv`)
 

@@ -68,19 +68,20 @@ Steps 2 and 3 are independent.
 | | |
 |-|-|
 | Sources | **Civil Comments** (Borkan et al. 2019; `google/civil_comments`, 1.8M news-site comments, toxicity = share of crowd raters, CC0) and **ETHOS** (Mollas et al. 2020; 998 YouTube/Reddit comments, human labels, GPL-3.0). ToxicCommons is optional and off (see below) |
-| Labels | toxic if at least half the raters said toxic (Civil Comments `toxicity ≥ 0.5`); ETHOS `isHate ≥ 0.5` |
+| Labels | Civil Comments: toxic if a strict majority of raters said toxic (`toxicity > 0.5`), clean if fewer than 30% did; the ambiguous band in between (rater ties) is dropped. ETHOS: `isHate ≥ 0.5` |
 | Sampling | 60k Civil Comments (half toxic) plus every toxic disability-mentioning comment and as many clean ones |
-| After cleaning | 65,150 posts: train 45,605 / val 6,515 / test 13,030 (stratified, deduplicated across sources), 49.6% toxic |
-| Categories | gender in 37% of posts (56% toxic), disability in 10.4% (48% toxic) |
-| Length | median 38 words; ~127 tokens with the prompt |
-| Verification set | 300 test posts (150 gender + 150 disability) for verified multi-word swaps |
+| Cleaning | HTML tags and URLs removed, spam dropped, exact and near-duplicates removed across sources before splitting |
+| After cleaning | 63,195 posts: train 44,234 / val 6,321 / test 12,640 (stratified), 49.5% toxic |
+| Categories | gender in 35.7% of posts (56% toxic), disability in 8.0% (48% toxic) |
+| Length | median 35 words; ~125 tokens with the prompt |
+| Verification set | 300 test posts (150 gender: 77 male / 73 female, no mixed posts; 150 disability) for verified multi-word swaps |
 
 Details, columns and the data review: [`data/processed/README.md`](data/processed/README.md).
 
 ## Status (25 Oct 2026)
 
 **Done**
-- Data pipeline rebuilt on Civil Comments + ETHOS; 26 offline tests pass.
+- Data pipeline rebuilt on Civil Comments + ETHOS and audited; 30 offline tests pass.
 - Training (M2, M4) and tagging pipelines built and tested end to end on a tiny stand-in model, on
   the new data too.
 - A quick run on Colab's A100 80 GB (on the old data) finished, with Qwen3-4B fully fine-tuned on 400
@@ -99,7 +100,12 @@ Details, columns and the data review: [`data/processed/README.md`](data/processe
 4. **Collapsed quick-run models.** Zero warmup on a 13-step run. `train_lm.py` now enforces a minimum
    warmup, validates before training, and flags collapsed models
    ([`training/README.md`](training/README.md)).
-5. **M4's disability pairs** block phrases ("special needs", "mentally ill"), not the common words
+5. **Data audit of the new build:**
+   - 27% of Civil Comments' toxic labels were rater ties (toxicity exactly 0.5), now dropped;
+   - 16 near-duplicate groups crossed train/test, now removed;
+   - leftover HTML tags and comment spam, now removed;
+   - 35 of 150 gender verification posts mixed genders, now excluded.
+6. **M4's disability pairs** block phrases ("special needs", "mentally ill"), not the common words
    "needs" and "ill".
 
 **Next:** re-run the quick test on the new data (it should not collapse), then train M2 and M4 in full.
