@@ -3,6 +3,13 @@
 Output of [`Content_Moderation.ipynb`](../../Content_Moderation.ipynb) (seed 0, Civil Comments + ETHOS).
 Rebuilding it with that notebook gives the same files.
 
+**At a glance**
+
+- **Final data:** 63,195 posts (train 44,234 / val 6,321 / test 12,640), 49.5% toxic.
+- **Gender:** 35.7% of posts, 56% toxic.
+- **Disability:** 8.0% of posts (3,555 in train), 48% toxic.
+- **Length:** a median of 35 words per post.
+
 | File | Rows | Use |
 |-|-|-|
 | `train.csv` | 44,234 | fine-tuning M2 / M4 |
