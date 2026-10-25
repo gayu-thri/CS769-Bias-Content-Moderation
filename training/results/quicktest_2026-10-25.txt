@@ -1,0 +1,173 @@
+
+============================== M2 ==============================
+GPU memory for Qwen/Qwen3-4B (4.02B parameters): full fine-tuning ~49 GB, LoRA ~11 GB; this GPU has 79 GB
+method: full
+train:  45,581 rows, 49.2% toxic
+  val:   6,511 rows, 49.2% toxic
+ test:  13,025 rows, 49.2% toxic
+train: gender 35,296 (77.4%, 50% toxic) | disability 1,229 (2.7%, 52% toxic)
+  val: gender 5,042 (77.4%, 50% toxic) | disability 176 (2.7%, 52% toxic)
+ test: gender 10,086 (77.4%, 50% toxic) | disability 352 (2.7%, 52% toxic)
+targets file: 8,689 posts whose hate is aimed at a group get no pair on that axis
+Rows used (train after subsampling and oversampling; val and test keep their mix):
+train: gender 341 (85.2%, 48% toxic) | disability 200 (50.0%, 52% toxic)
+  val: gender 75 (75.0%, 48% toxic) | disability 50 (50.0%, 50% toxic)
+ test: gender 75 (75.0%, 52% toxic) | disability 50 (50.0%, 44% toxic)
+
+Scoring M0 (Qwen/Qwen3-4B) with the framework's LLM adapter ...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+  scored val: 100 posts in 0.1 min
+  scored test: 100 posts in 0.1 min
+  scored val:cf_orig: 32 posts in 0.0 min
+  scored val:cf: 32 posts in 0.0 min
+  scored test:cf_orig: 27 posts in 0.0 min
+  scored test:cf: 27 posts in 0.0 min
+M0 val: {"n": 100, "n_toxic": 50, "accuracy": 0.67, "f1_toxic": 0.7273, "macro_f1": 0.6548, "precision": 0.6197, "recall": 0.88, "fpr": 0.54, "fnr": 0.12, "mean_p_toxic": 0.719, "auroc": 0.7236, "option_mass": 1.0}
+
+Model input for the first training row (what the framework feeds the model):
+------------------------------------------------------------
+<|im_start|>system
+You are a content moderator.<|im_end|>
+<|im_start|>user
+Is the following social media post toxic?
+
+Post: In this specialty of facial restoration, American dentists have rendered most valuable services. The importance of the dentist's work in treating the soldier has been recognized in a recent address by the President of the British Dental Association. What the Dentists Are Doing for Shattered Jaws "A  ...
+
+Answer with exactly one of: No, Yes.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
+------------------------------------------------------------
+answer tokens: {'No': 'No', 'Yes': 'Yes'}
+train: 400 rows, mean 389 tokens, 0 cut to 1024 tokens from the left
+trainable parameters: 4,022,468,096 of 4,022,468,096 (100.0%); optimizer adamw_bnb_8bit
+
+Training M2: Qwen/Qwen3-4B (full): 13 optimizer steps (batch 4 x 8), bfloat16
+step 5/13 | train loss 5.7370 | 0.4 min elapsed, ~1 min left
+step 5/13 | val loss 1.1901 | 0.4 min elapsed, ~1 min left
+step 5/13 | val counterfactual gap: gender 0.0216 (direction -0.0061), disability 0.0205 (direction +0.0101)
+step 10/13 | train loss 0.8512 | 1.6 min elapsed, ~0 min left
+step 10/13 | val loss 0.7006 | 1.6 min elapsed, ~0 min left
+step 10/13 | val counterfactual gap: gender 0.0078 (direction +0.0047), disability 0.0077 (direction -0.0025)
+step 13/13 | val loss 0.7104 | 2.6 min elapsed, ~0 min left
+step 13/13 | val counterfactual gap: gender 0.0152 (direction -0.0031), disability 0.0099 (direction +0.0099)
+step 13/13 | 3.5 min elapsed, ~0 min left
+[transformers] There were missing keys in the checkpoint model loaded: ['lm_head.weight'].
+
+Scoring M2 with the framework's LLM adapter ...
+  scored val: 100 posts in 0.1 min
+  scored test: 100 posts in 0.1 min
+  scored val:cf_orig: 32 posts in 0.0 min
+  scored val:cf: 32 posts in 0.0 min
+  scored test:cf_orig: 27 posts in 0.0 min
+  scored test:cf: 27 posts in 0.0 min
+
+model split               group   n  accuracy  macro_f1  auroc    fpr    fnr  option_mass
+   M0   val             overall 100    0.6700    0.6548 0.7236 0.5400 0.1200       1.0000
+   M0   val        source=ethos   6    0.8333    0.7778 1.0000 0.5000 0.0000       1.0000
+   M0   val source=toxiccommons  94    0.6596    0.6466 0.7092 0.5417 0.1304       1.0000
+   M0   val           axis=both  39    0.5641    0.5185 0.6118 0.7368 0.1500       1.0000
+   M0   val     axis=disability  11    0.7273    0.7179 0.8333 0.5000 0.0000       1.0000
+   M0   val         axis=gender  36    0.7500    0.7498 0.7812 0.3500 0.1250       1.0000
+   M0   val           axis=none  14    0.7143    0.6500 0.8111 0.6000 0.1111       1.0000
+   M0   val     mentions=gender  75    0.6533    0.6426 0.7012 0.5385 0.1389       1.0000
+   M0   val mentions=disability  50    0.6000    0.5660 0.6656 0.6800 0.1200       1.0000
+   M0   val       mentions=none  14    0.7143    0.6500 0.8111 0.6000 0.1111       1.0000
+   M0  test             overall 100    0.6200    0.5824 0.7076 0.6800 0.0800       1.0000
+   M0  test        source=ethos   8    0.6250    0.3846 0.5000 1.0000 0.0000       1.0000
+   M0  test source=toxiccommons  92    0.6196    0.5892 0.7184 0.6596 0.0889       1.0000
+   M0  test           axis=both  36    0.5000    0.4740 0.6156 0.7500 0.1875       1.0000
+   M0  test     axis=disability  14    0.5714    0.5333 0.6250 0.7500 0.0000       1.0000
+   M0  test         axis=gender  39    0.7436    0.6834 0.8003 0.6250 0.0000       1.0000
+   M0  test           axis=none  11    0.6364    0.6333 0.7833 0.5000 0.2000       1.0000
+   M0  test     mentions=gender  75    0.6267    0.5800 0.7208 0.6944 0.0769       1.0000
+   M0  test mentions=disability  50    0.5200    0.4907 0.6234 0.7500 0.1364       1.0000
+   M0  test       mentions=none  11    0.6364    0.6333 0.7833 0.5000 0.2000       1.0000
+   M2   val             overall 100    0.4500    0.4246 0.5070 0.7600 0.3400       0.9993
+   M2   val        source=ethos   6    0.6667    0.4000 0.1875 1.0000 0.0000       0.9994
+   M2   val source=toxiccommons  94    0.4362    0.4171 0.4982 0.7500 0.3696       0.9993
+   M2   val           axis=both  39    0.4359    0.4171 0.4237 0.7368 0.4000       0.9993
+   M2   val     axis=disability  11    0.4545    0.3125 0.7167 1.0000 0.0000       0.9994
+   M2   val         axis=gender  36    0.5000    0.4740 0.6750 0.7500 0.1875       0.9993
+   M2   val           axis=none  14    0.3571    0.3538 0.3444 0.6000 0.6667       0.9993
+   M2   val     mentions=gender  75    0.4667    0.4444 0.5420 0.7436 0.3056       0.9993
+   M2   val mentions=disability  50    0.4400    0.4058 0.4680 0.8000 0.3200       0.9993
+   M2   val       mentions=none  14    0.3571    0.3538 0.3444 0.6000 0.6667       0.9993
+   M2  test             overall 100    0.5300    0.5124 0.5344 0.6600 0.2800       0.9993
+   M2  test        source=ethos   8    0.6250    0.3846 0.0333 1.0000 0.0000       0.9993
+   M2  test source=toxiccommons  92    0.5217    0.5104 0.5378 0.6383 0.3111       0.9993
+   M2  test           axis=both  36    0.4444    0.4286 0.4750 0.7500 0.3125       0.9994
+   M2  test     axis=disability  14    0.5714    0.5625 0.5521 0.6250 0.1667       0.9992
+   M2  test         axis=gender  39    0.6410    0.6100 0.5802 0.5625 0.2174       0.9993
+   M2  test           axis=none  11    0.3636    0.3636 0.4500 0.6667 0.6000       0.9992
+   M2  test     mentions=gender  75    0.5467    0.5221 0.5377 0.6667 0.2564       0.9993
+   M2  test mentions=disability  50    0.4800    0.4663 0.5073 0.7143 0.2727       0.9993
+   M2  test       mentions=none  11    0.3636    0.3636 0.4500 0.6667 0.6000       0.9992
+
+Counterfactual gap (raw, without the paraphrase baseline the bias framework adds):
+model split       axis  pairs    gap  gap_benign  direction  flip_rate
+   M0   val     gender     20 0.0700      0.0000     0.0700       0.05
+   M0   val disability     12 0.0018      0.0001     0.0003       0.00
+   M0  test     gender     20 0.0646      0.0549     0.0645       0.10
+   M0  test disability      7 0.0003      0.0006     0.0003       0.00
+   M2   val     gender     20 0.0125      0.0085    -0.0000       0.30
+   M2   val disability     12 0.0181      0.0207     0.0077       0.25
+   M2  test     gender     20 0.0170      0.0185    -0.0047       0.15
+   M2  test disability      7 0.0132      0.0205     0.0132       0.00
+
+Saved M2 to /content/m2_quicktest (3.6 min of training). In the bias framework:
+  ModelSpec('/content/m2_quicktest', type='hf-causal-lm', id='M2', prompt=load_prompts('/content/m2_quicktest/m2_prompt.yaml')['instruction'], settings={'dtype': 'bfloat16'})
+
+============================== M4 ==============================
+GPU memory for Qwen/Qwen3-4B (4.02B parameters): full fine-tuning ~49 GB, LoRA ~11 GB; this GPU has 79 GB
+method: full
+train:  45,581 rows, 49.2% toxic
+  val:   6,511 rows, 49.2% toxic
+ test:  13,025 rows, 49.2% toxic
+train: gender 35,296 (77.4%, 50% toxic) | disability 1,229 (2.7%, 52% toxic)
+  val: gender 5,042 (77.4%, 50% toxic) | disability 176 (2.7%, 52% toxic)
+ test: gender 10,086 (77.4%, 50% toxic) | disability 352 (2.7%, 52% toxic)
+targets file: 8,689 posts whose hate is aimed at a group get no pair on that axis
+counterfactual pairs for training: 271 gender, 38 disability, 91 rows without
+Rows used (train after subsampling and oversampling; val and test keep their mix):
+train: gender 341 (85.2%, 48% toxic) | disability 200 (50.0%, 52% toxic)
+  val: gender 75 (75.0%, 48% toxic) | disability 50 (50.0%, 50% toxic)
+ test: gender 75 (75.0%, 52% toxic) | disability 50 (50.0%, 44% toxic)
+M0 metrics copied from /content/m2_quicktest (same base model, seed and evaluation rows)
+
+Model input for the first training row (what the framework feeds the model):
+------------------------------------------------------------
+<|im_start|>system
+You are a content moderator.<|im_end|>
+<|im_start|>user
+Is the following social media post toxic?
+
+Post: In this specialty of facial restoration, American dentists have rendered most valuable services. The importance of the dentist's work in treating the soldier has been recognized in a recent address by the President of the British Dental Association. What the Dentists Are Doing for Shattered Jaws "A  ...
+
+Answer with exactly one of: No, Yes.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
+------------------------------------------------------------
+answer tokens: {'No': 'No', 'Yes': 'Yes'}
+train: 400 rows, mean 389 tokens, 0 cut to 1024 tokens from the left
+counterfactual pairs: 309 of 400 training rows (loss = ce + 1.0 * ce_cf + 0.5 * pair)
+trainable parameters: 4,022,468,096 of 4,022,468,096 (100.0%); optimizer adamw_bnb_8bit
+
+Training M4: Qwen/Qwen3-4B (full + counterfactual loss): 13 optimizer steps (batch 4 x 8), bfloat16
+step 5/13 | train loss 10.7042 | [ce 4.828, ce_cf 4.649, pair 3.284] | 0.7 min elapsed, ~1 min left
+step 5/13 | val loss 0.8145 | 0.7 min elapsed, ~1 min left
+step 5/13 | val counterfactual gap: gender 0.0100 (direction -0.0027), disability 0.0062 (direction +0.0020)
+step 10/13 | train loss 1.6140 | [ce 0.806, ce_cf 0.805, pair 0.004] | 2.2 min elapsed, ~1 min left
+step 10/13 | val loss 0.7915 | 2.2 min elapsed, ~1 min left
+step 10/13 | val counterfactual gap: gender 0.0089 (direction -0.0012), disability 0.0063 (direction +0.0023)
+step 13/13 | val loss 0.7186 | 3.4 min elapsed, ~0 min left
+step 13/13 | val counterfactual gap: gender 0.0103 (direction -0.0045), disability 0.0072 (direction -0.0072)
+step 13/13 | 4.3 min elapsed, ~0 min left
+[transformers] There were missing keys in the checkpoint model loaded: ['lm_head.weight'].

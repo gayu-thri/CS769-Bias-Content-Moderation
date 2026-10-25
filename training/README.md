@@ -1,4 +1,4 @@
-# Training (M0 → M2) and tagging
+# Training (M0 → M2, M4)
 
 Run order on Colab:
 
@@ -47,8 +47,8 @@ would no longer measure ordinary fine-tuning. M1 and M3 (few-shot) need no train
   curve. It's never used to select checkpoints.
 - **Cost:** about 1.7× M2's compute.
 
-**M0 = `Qwen/Qwen3-4B`, a small instruction-tuned LM, not BERT.** At the midterm, Lucy pointed out
-that BERT is dated and suggested small, laptop-sized LMs (Gemma, Phi, small Qwen). Why Qwen3-4B:
+**M0 = `Qwen/Qwen3-4B`, a small instruction-tuned LM, not BERT.** In feedback on our proposal, Lucy pointed
+out that BERT is dated and suggested small, laptop-sized LMs (Gemma, Phi, small Qwen). Why Qwen3-4B:
 
 - It's text-only, has a standard architecture, uses the Apache 2.0 licence, and isn't gated.
 - 4B is the size the Qwen team ships as a moderator: Qwen3Guard-Gen-4B (Qwen Team, 2025) is fine-tuned
@@ -133,6 +133,39 @@ ceiling for human-model agreement.
   The comparison is "same data, extra counterfactual signal", not "same compute".
 - `train_lm.py` and the notebook were tested end to end on a tiny random Qwen3 with the real Qwen3
   tokenizer, on real posts: full fine-tuning, LoRA, M4's counterfactual loss (and its gradients), the
-  quick test, scoring through the framework, and the Hub upload (mocked). The real Qwen3-0.6B weights were checked through the framework's scorer on real posts
-  (option mass 0.998–0.999). Not run yet: real-weight training, and anything GPU-only (8-bit AdamW,
-  bf16/fp16 autocast, the memory check on a real GPU). Those first run on Colab.
+  quick test, scoring through the framework, and the Hub upload (mocked).
+
+## Quick run on Colab (25 Oct 2026, A100 80 GB)
+
+Full log: [`results/quicktest_2026-10-25.txt`](results/quicktest_2026-10-25.txt). The run used Qwen3-4B,
+full fine-tuning, 400 training posts and 13 optimizer steps per model.
+
+**Works:**
+- the memory check (~49 GB needed, full fine-tuning chosen);
+- 8-bit AdamW with bf16;
+- M0 answers in the requested format (option mass 1.0);
+- scoring through the framework, counterfactual pairs, and the M0/M2/M4 comparison;
+- M4 reuses M0's numbers.
+
+The `lm_head.weight` "missing key" warning is harmless: Qwen3-4B ties its input and output embeddings.
+
+**Not usable as results: both models collapsed.**
+
+| test | M0 | M2 | M4 |
+|-|-|-|-|
+| AUROC | 0.71 | 0.53 | 0.46 |
+| FPR / FNR | 0.68 / 0.08 | 0.66 / 0.28 | 0.00 / 1.00 (always "No") |
+
+- The training loss averaged 5.7 (M2) and 4.8 (M4) over the first 5 steps, against a starting level
+  around 1.
+- 3% warmup of 13 steps rounds to zero, so full fine-tuning started at the full learning rate.
+- M4's pairing term then fell to ~0 only because the model gave every post the same answer, so a
+  collapsed model's low counterfactual gap means nothing.
+- The full run (~650 steps, ~19 warmup steps) is less exposed.
+
+**To do before the full run:**
+- enforce a minimum warmup;
+- validate before training, to log M0's starting loss;
+- warn when a model collapses, and keep collapsed models out of the takeaway sentence;
+- block disability phrases ("special needs", "mentally ill") instead of single words in the pair rules;
+- fix the training labels ([data README](../data/processed/README.md)).
