@@ -114,6 +114,9 @@ def parse_args(argv=None):
                    help="memory: keep the best weights in CPU RAM (seconds per evaluation, nothing written); "
                         "disk: Trainer checkpoints in --checkpoint-dir (16 GB each for a fully fine-tuned 4B "
                         "model). memory falls back to disk when RAM is short")
+    p.add_argument("--tensorboard-dir", default=None,
+                   help="write TensorBoard logs here (one subfolder per run): train and validation loss, learning "
+                        "rate, M4's loss parts and the validation counterfactual gap")
     p.add_argument("--stage-dir", default=None,
                    help="save the trained model here first (fast local disk), score it from here, then copy it to "
                         "--output-dir once (e.g. Colab's /content while --output-dir is on Drive)")
@@ -689,7 +692,7 @@ def make_progress_callback():
             self.start = time.time()
 
         def on_log(self, args, state, control, logs=None, **kwargs):
-            if not logs or not state.max_steps:
+            if not logs or not state.max_steps or not ({"loss", "eval_loss"} & set(logs)):
                 return
             elapsed = time.time() - self.start
             done = max(state.global_step, 1) / state.max_steps
@@ -699,13 +702,8 @@ def make_progress_callback():
                 parts.append(f"train loss {logs['loss']:.4f}")
             if "eval_loss" in logs:
                 parts.append(f"val loss {logs['eval_loss']:.4f}")
-            trainer = getattr(self, "trainer", None)
-            stats = getattr(trainer, "cf_stats", None)
-            if "loss" in logs and stats and stats["n"]:
-                parts.append(f"[ce {stats['ce'] / stats['n']:.3f}, ce_cf {stats['ce_cf'] / stats['n']:.3f}, "
-                             f"pair {stats['pair'] / stats['n']:.3f}]")
-                for key in stats:
-                    stats[key] = 0.0
+            if "loss" in logs and "ce" in logs:  # M4's loss parts, added to the log by the trainer
+                parts.append(f"[ce {logs['ce']:.3f}, ce_cf {logs['ce_cf']:.3f}, pair {logs['pair']:.3f}]")
             parts.append(f"{elapsed / 60:.1f} min elapsed, ~{eta / 60:.0f} min left")
             print(" | ".join(parts), flush=True)
 
@@ -748,6 +746,9 @@ def make_gap_callback(pairs, render, tokenizer, chat, max_length, answer_ids, to
             if was_training:
                 model.train()
             self.history.append({"step": state.global_step, **{a: g for a, g in gaps.items()}})
+            trainer = getattr(self, "trainer", None)
+            if trainer is not None:  # to the log history and TensorBoard (eval/cf_gap_gender, ...)
+                trainer.log({f"eval_cf_{key}_{axis}": g[key] for axis, g in gaps.items() for key in ("gap", "direction")})
             label = f"step {state.global_step}/{state.max_steps}" if state.max_steps else "step 0 (before training)"
             print(f"{label} | val counterfactual gap: " + ", ".join(
                 f"{a} {g['gap']:.4f} (direction {g['direction']:+.4f})" for a, g in gaps.items()), flush=True)
@@ -836,6 +837,16 @@ def make_trainer_class(answer_ids):
         cf_weight = 0.0
         pair_weight = 0.0
         yes_no = None
+
+        def log(self, logs, *args, **kwargs):
+            # M4's loss parts, averaged since the last log, go into the same log entry (and TensorBoard).
+            stats = getattr(self, "cf_stats", None)
+            if stats and stats["n"] and "loss" in logs:
+                logs = {**logs, "ce": stats["ce"] / stats["n"], "ce_cf": stats["ce_cf"] / stats["n"],
+                        "pair": stats["pair"] / stats["n"]}
+                for key in stats:
+                    stats[key] = 0.0
+            return super().log(logs, *args, **kwargs)
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             labels = inputs.pop("labels")
@@ -1040,12 +1051,22 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
         warmup_steps=warmup_steps, lr_scheduler_type="cosine",
         logging_steps=max(1, min(10, eval_steps)), eval_steps=eval_steps, save_steps=eval_steps,
         save_strategy="steps", load_best_model_at_end=True, metric_for_best_model="eval_loss",
-        greater_is_better=False, save_total_limit=2, seed=args.seed, report_to="none",
+        greater_is_better=False, save_total_limit=2, seed=args.seed, report_to="none", logging_first_step=True,
         bf16=use_cuda and dtype_name == "bfloat16", fp16=use_cuda and dtype_name == "float16",
         remove_unused_columns=False, label_names=["labels"], prediction_loss_only=True,
         dataloader_num_workers=2 if use_cuda else 0, max_grad_norm=1.0, disable_tqdm=True,
     )
     accepted = inspect.signature(TrainingArguments.__init__).parameters
+    tensorboard_run = None
+    if args.tensorboard_dir:
+        tensorboard_run = Path(args.tensorboard_dir) / f"{args.variant}_{time.strftime('%Y-%m-%d_%H%M%S')}"
+        tensorboard_run.mkdir(parents=True, exist_ok=True)
+        targs["report_to"] = ["tensorboard"]
+        if "logging_dir" in accepted:  # transformers 4.x
+            targs["logging_dir"] = str(tensorboard_run)
+        else:  # transformers 5 reads it from the environment
+            os.environ["TENSORBOARD_LOGGING_DIR"] = str(tensorboard_run)
+        print(f"TensorBoard logs: {tensorboard_run}")
     if args.device == "cpu":
         targs["use_cpu" if "use_cpu" in accepted else "no_cuda"] = True
     targs["eval_strategy" if "eval_strategy" in accepted else "evaluation_strategy"] = "steps"
@@ -1082,6 +1103,8 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     if args.counterfactual:
         trainer.cf_weight, trainer.pair_weight = args.cf_weight, args.pair_weight
     progress.trainer = trainer
+    if gap is not None:
+        gap.trainer = trainer
     # compute_loss returns a per-batch mean, so the Trainer must divide it by the accumulation
     # steps itself (a PEFT model would otherwise be assumed to normalise across them).
     trainer.model_accepts_loss_kwargs = False
@@ -1094,6 +1117,7 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     # The base model's validation loss (and counterfactual gap) before any update: the level training must beat.
     val_loss_before = trainer.evaluate().get("eval_loss")
     print(f"step 0/{total_steps} | val loss {val_loss_before:.4f} (before training: the base model)", flush=True)
+    pre_train_logs = list(trainer.state.log_history)  # train() starts a fresh history; keep the step-0 points
     start = time.time()
     output = trainer.train()
     minutes = (time.time() - start) / 60
@@ -1122,15 +1146,59 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
             "val_loss_before": val_loss_before,
             "trainable_parameters": n_train, "train_loss": output.training_loss, "train_minutes": round(minutes, 1),
             "best_checkpoint": best_checkpoint, "best_val_loss": best_val_loss, "checkpointing": checkpointing,
-            "optimizer_steps": state.global_step, "log_history": state.log_history,
+            "optimizer_steps": state.global_step, "log_history": pre_train_logs + list(state.log_history),
             "answer_tokens": dict(zip(answers, tokenizer.convert_ids_to_tokens(answer_ids))),
             "inputs_truncated": truncated, "mean_tokens": float(np.mean(lengths["train"])),
-            "val_counterfactual_gap_curve": list(gap.history) if gap else []}
+            "val_counterfactual_gap_curve": list(gap.history) if gap else [],
+            "tensorboard_run": str(tensorboard_run) if tensorboard_run else None}
     del trainer, merged, model
     gc.collect()
     if use_cuda:
         torch.cuda.empty_cache()
     return info
+
+
+# ---------------------------------------------------------------- training curves
+
+def save_training_curves(log_history, path, title):
+    """The run's final curves as one PNG: train and validation loss (step 0 = the base model), M4's
+    loss parts, and the validation counterfactual gap per category. Returns the path, or None."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    def series(key):
+        return [(e["step"], e[key]) for e in log_history if key in e and "step" in e]
+
+    if series("ce"):  # M4: its total objective adds the counterfactual terms; plain CE is comparable to val
+        loss_lines = [("train loss (ce)", series("ce"), "-"), ("train total (ce + cf terms)", series("loss"), ":"),
+                      ("val loss", series("eval_loss"), "o-")]
+    else:
+        loss_lines = [("train loss", series("loss"), "-"), ("val loss", series("eval_loss"), "o-")]
+    panels = [("Loss", loss_lines)]
+    if series("ce"):
+        panels.append(("M4 loss parts", [("ce", series("ce"), "-"), ("ce_cf", series("ce_cf"), "-"),
+                                         ("pair", series("pair"), "-")]))
+    gaps = [(f"{axis} gap", series(f"eval_cf_gap_{axis}"), "o-") for axis in BIAS_AXES]
+    if any(points for _, points, _ in gaps):
+        panels.append(("Validation counterfactual gap", gaps))
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 3.8), squeeze=False)
+    for ax, (name, lines) in zip(axes[0], panels):
+        for label, points, style in lines:
+            if points:
+                ax.plot(*zip(*points), style, label=label, markersize=4)
+        ax.set_title(name)
+        ax.set_xlabel("optimizer step")
+        ax.legend()
+        ax.grid(alpha=0.3)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
 
 
 # ---------------------------------------------------------------- collapse check
@@ -1443,6 +1511,11 @@ def main(argv=None):
     with open(out_dir / "training_summary.json", "w") as handle:
         json.dump(summary, handle, indent=2, default=str)
     (out_dir / "README.md").write_text(model_card(summary, prompt, task, args.card_license), encoding="utf-8")
+    curves = save_training_curves(info.get("log_history") or [], out_dir / "training_curves.png",
+                                  f"{args.variant}: {args.base_model} ({args.method} fine-tuning"
+                                  f"{' + counterfactual loss' if args.counterfactual else ''})")
+    if curves:
+        print(f"Training curves: {curves}")
     if model_dir != out_dir:  # one copy of the model to the output folder (Drive), after scoring from local disk
         start = time.time()
         print(f"Copying {args.variant} from {model_dir} to {out_dir} ...", flush=True)

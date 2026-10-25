@@ -91,6 +91,18 @@ change if the run cannot fit. The method used is recorded in `training_summary.j
   then copied to Drive once, instead of being read back from Drive.
 - **GPU-sized scoring batches** (`--eval-batch-size auto`): 32 posts on GPUs with 40 GB or more.
 
+**Loss curves, live and final.**
+- **Live:** `--tensorboard-dir` logs to TensorBoard (one subfolder per run, e.g. `M2_2026-10-26_1530`). In
+  the notebook, run section 3b before training: a TensorBoard panel opens and refreshes every 15 s.
+  - `train/`: `loss`, `learning_rate`, `grad_norm`, and for M4 `ce`, `ce_cf` and `pair`.
+  - `eval/`: `loss` from step 0 (the base model), plus `cf_gap_*` and `cf_direction_*` per category.
+
+  The logs stay in `tensorboard/` on Drive.
+- **Final:** each run saves `training_curves.png` in its model folder (loss, M4's loss parts, validation
+  counterfactual gap), and the notebook saves `comparison/training_curves_M2_M4.png`. For M4, the plain
+  cross-entropy part is plotted as its train loss, so it's comparable to M2 and to validation; its total
+  objective, which adds the counterfactual terms, is dotted.
+
 **Training data size.** 20,000 of the ~44,200 training posts for one epoch (all disability posts kept).
 Posts average about 125 tokens with the prompt, so a run takes well under an hour.
 `MAX_TRAIN_SAMPLES = 0` uses everything.
