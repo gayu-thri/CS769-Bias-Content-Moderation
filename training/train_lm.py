@@ -92,6 +92,9 @@ def parse_args(argv=None):
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
+    p.add_argument("--min-warmup-steps", type=int, default=10,
+                   help="warmup at least this many optimizer steps (capped at a third of the run), so short runs "
+                        "never start at the full learning rate")
     p.add_argument("--eval-steps", type=int, default=100, help="validation loss every N optimizer steps")
     p.add_argument("--patience", type=int, default=3, help="early stopping, in evaluations without improvement")
     p.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto",
@@ -270,11 +273,19 @@ PERSON_NOUNS = ("man", "woman", "men", "women", "guy", "guys", "girl", "girls", 
                 "lady", "ladies", "gentleman", "citizen", "citizens", "folks", "patient", "patients", "player",
                 "players", "customer", "customers", "employee", "employees")
 DETERMINERS = ("a", "an", "the", "my", "his", "her", "our", "their", "your", "this", "that", "these", "those", "some")
-# Slurs and other disability words the rules cannot swap cleanly: such posts get no disability pair.
+# Slurs and other disability terms the rules cannot swap cleanly: such posts get no disability pair.
+# Single words here are unambiguous; multi-word terms are matched as phrases, so common words on their
+# own ("needs", "ill", "hearing") do not block a post.
 DIS_BLOCKERS = ("retard", "retarded", "retards", "cripple", "crippled", "mongoloid", "lunatic", "psycho", "deformed",
-                "wheelchair", "autism", "dwarf", "dwarfism", "asperger", "aspergers", "syndrome", "adhd", "ptsd", "ocd",
-                "schizophrenia", "epilepsy", "dyslexia", "disability", "disabilities", "illness", "ill",
-                "impaired", "hearing", "needs")
+                "wheelchair", "autism", "dwarf", "dwarfism", "asperger", "aspergers", "adhd", "ptsd", "ocd",
+                "schizophrenia", "epilepsy", "dyslexia", "disability", "disabilities")
+DIS_BLOCKER_PHRASES = ("special needs", "mentally ill", "mental illness", "chronic illness", "hard of hearing",
+                       "hearing impaired", "visually impaired", "down syndrome", "down's syndrome", "downs syndrome",
+                       "cerebral palsy", "intellectual disability", "learning disability", "anxiety disorder",
+                       "clinical depression")
+_BLOCKER_PHRASE_RE = re.compile(
+    r"\b(?:" + "|".join(r"\s+".join(re.escape(w).replace("'", "['’]?") for w in p.split())
+                        for p in DIS_BLOCKER_PHRASES) + r")\b", re.I)
 _NOUNS = "|".join(PERSON_NOUNS)
 _DETS = "|".join(DETERMINERS)
 _REMOVE_RE = re.compile(rf"\b(?:(?P<det>a|an)\s+)?(?P<adj>{'|'.join(DIS_ADJECTIVES)})\s+(?P<noun>{_NOUNS})\b", re.I)
@@ -298,7 +309,7 @@ def disability_counterfactual(text, mentions_disability, rng):
     every disability adjective before a person noun ("my deaf cousin" -> "my cousin"); a post
     that does not gains one before its first person noun ("my cousin" -> "my deaf cousin")."""
     words = {w.lower() for w in _WORD_RE.findall(text)}
-    if words & set(DIS_BLOCKERS):
+    if words & set(DIS_BLOCKERS) or _BLOCKER_PHRASE_RE.search(text):
         return None
     if mentions_disability:
         def remove(m):
@@ -499,6 +510,7 @@ def binary_metrics(y_true, p_toxic, threshold=0.5):
         "fpr": div(fp, fp + tn),  # benign posts flagged toxic: the harm the proposal targets
         "fnr": div(fn, fn + tp),
         "mean_p_toxic": float(p_toxic.mean()) if len(p_toxic) else float("nan"),
+        "pred_toxic_share": float(y_pred.mean()) if len(y_pred) else float("nan"),
     }
     if 0 < y_true.sum() < len(y_true):
         from sklearn.metrics import roc_auc_score
@@ -923,11 +935,14 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     steps_per_epoch = max(1, math.ceil(len(data["train"]) / (args.batch_size * args.grad_accum)))
     total_steps = max(1, math.ceil(steps_per_epoch * args.epochs))
     eval_steps = max(1, min(args.eval_steps, total_steps))
+    # A ratio alone rounds to 0 on short runs (3% of 13 steps), and full fine-tuning at the full learning rate
+    # from step 1 collapsed the quick-test models; so warm up for at least a few steps.
+    warmup_steps = max(int(round(args.warmup_ratio * total_steps)), min(args.min_warmup_steps, max(1, total_steps // 3)))
     targs = dict(
         output_dir=str(checkpoint_dir), per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size, gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr, optim=optim, num_train_epochs=args.epochs, weight_decay=args.weight_decay,
-        warmup_steps=int(args.warmup_ratio * total_steps), lr_scheduler_type="cosine",
+        warmup_steps=warmup_steps, lr_scheduler_type="cosine",
         logging_steps=max(1, min(10, eval_steps)), eval_steps=eval_steps, save_steps=eval_steps,
         save_strategy="steps", load_best_model_at_end=True, metric_for_best_model="eval_loss",
         greater_is_better=False, save_total_limit=2, seed=args.seed, report_to="none",
@@ -975,7 +990,10 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
 
     print(f"\nTraining {args.variant}: {args.base_model} ({'full' if args.method == 'full' else 'LoRA'}"
           f"{' + counterfactual loss' if args.counterfactual else ''}): {total_steps} optimizer steps "
-          f"(batch {args.batch_size} x {args.grad_accum}), {dtype_name}")
+          f"(batch {args.batch_size} x {args.grad_accum}), {warmup_steps} warmup steps, {dtype_name}")
+    # The base model's validation loss (and counterfactual gap) before any update: the level training must beat.
+    val_loss_before = trainer.evaluate().get("eval_loss")
+    print(f"step 0/{total_steps} | val loss {val_loss_before:.4f} (before training: the base model)", flush=True)
     start = time.time()
     output = trainer.train()
     minutes = (time.time() - start) / 60
@@ -993,7 +1011,8 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     merged.save_pretrained(str(out_dir), safe_serialization=True)
     tokenizer.save_pretrained(str(out_dir))
 
-    info = {"method": args.method, "optimizer": optim, "learning_rate": args.lr,
+    info = {"method": args.method, "optimizer": optim, "learning_rate": args.lr, "warmup_steps": warmup_steps,
+            "val_loss_before": val_loss_before,
             "trainable_parameters": n_train, "train_loss": output.training_loss, "train_minutes": round(minutes, 1),
             "best_checkpoint": state.best_model_checkpoint, "best_val_loss": state.best_metric,
             "optimizer_steps": state.global_step, "log_history": state.log_history,
@@ -1005,6 +1024,31 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     if use_cuda:
         torch.cuda.empty_cache()
     return info
+
+
+# ---------------------------------------------------------------- collapse check
+
+def collapse_warnings(trained, baseline=None, val_loss_before=None, best_val_loss=None):
+    """Reasons a trained model looks collapsed (it ignores its input), from its validation metrics.
+    A collapsed model's counterfactual gap is near zero because it gives every post the same answer,
+    not because it is unbiased, so its bias numbers must not be read as results."""
+    reasons = []
+    share = trained.get("pred_toxic_share")
+    if share is not None and not math.isnan(share):
+        if share <= 0.05:
+            reasons.append(f"answers non-toxic for {1 - share:.0%} of validation posts")
+        elif share >= 0.95:
+            reasons.append(f"answers toxic for {share:.0%} of validation posts")
+    auroc = trained.get("auroc")
+    if auroc is not None and auroc < 0.6:
+        reasons.append(f"validation AUROC {auroc:.2f} is close to chance (0.5)")
+    base_auroc = (baseline or {}).get("auroc")
+    if auroc is not None and base_auroc is not None and auroc < base_auroc - 0.1:
+        reasons.append(f"validation AUROC fell from {base_auroc:.2f} (M0) to {auroc:.2f}")
+    if val_loss_before is not None and best_val_loss is not None and best_val_loss >= val_loss_before - 1e-3:
+        reasons.append(f"best validation loss {best_val_loss:.4f} never improved on the base model's "
+                       f"{val_loss_before:.4f}")
+    return reasons
 
 
 # ---------------------------------------------------------------- model card
@@ -1059,6 +1103,11 @@ def model_card(summary, prompt, task, license_id):
                            f"targets the swapped group get no pair.")
     else:
         objective_extra = ""
+    collapse_note = ""
+    if summary.get("collapse_warnings"):
+        collapse_note = ("\n> **Warning: this run looks collapsed** (the model ignores its input): "
+                         + "; ".join(summary["collapse_warnings"])
+                         + ". Its metrics and counterfactual gaps below are not results.\n")
     system_line = f'        {{"role": "system", "content": {prompt.system!r}}},\n' if prompt.system else ""
     hp = summary["hyperparameters"]
     return f"""---
@@ -1084,7 +1133,7 @@ compares the base model (M0), plain fine-tuning (M2) and fine-tuning with a coun
 and without few-shot prompting, using a counterfactual bias test:
 how much the answer moves when only the gender or disability a post refers to is swapped, beyond how
 much it moves under matched neutral rewordings (Yang et al., 2026).
-
+{collapse_note}
 ## How to use
 
 The model is read as a classifier: the probability of the first answer token after the prompt it was
@@ -1247,6 +1296,9 @@ def main(argv=None):
 
     print(f"\nScoring {args.variant} with the framework's LLM adapter ...")
     record(args.variant, framework_scores(out_dir, prompt, task, to_score, args, dtype_name, None))
+    collapsed = collapse_warnings(results[args.variant]["val"]["overall"],
+                                  results.get("M0", {}).get("val", {}).get("overall"),
+                                  info.get("val_loss_before"), info.get("best_val_loss"))
 
     for s, frame in eval_frames.items():
         keep = [c for c in ("id", "source", "axis", "label") if c in frame.columns]
@@ -1268,6 +1320,7 @@ def main(argv=None):
         "variant": args.variant, "counterfactual": args.counterfactual,
         "counterfactual_weights": {"cf_weight": args.cf_weight, "pair_weight": args.pair_weight} if args.counterfactual else None,
         "counterfactual_metrics": cf_results,
+        "collapse_warnings": collapsed,
         "base_model": args.base_model, "method": args.method, "output_dir": str(out_dir), "framework_type": "hf-causal-lm",
         "prompt": prompt.to_public_dict(), "dtype": dtype_name, "max_length": args.max_length,
         "rows": {k: len(v) for k, v in frames.items()}, "axis_composition": composition, **info,
@@ -1289,6 +1342,12 @@ def main(argv=None):
         if len(cf_table):
             print("\nCounterfactual gap (raw, without the paraphrase baseline the bias framework adds):")
             print(cf_table.round(4).to_string(index=False))
+    if collapsed:
+        print("\n" + "!" * 72 + f"\nWARNING: {args.variant} looks COLLAPSED (it ignores its input):")
+        for reason in collapsed:
+            print(f"  - {reason}")
+        print("Its error rates and counterfactual gaps are not results (a constant answer has no gap).\n"
+              "Check the training log: a loss spike in the first steps, too short a run, or noisy labels.\n" + "!" * 72)
     print(f"\nSaved {args.variant} to {out_dir} ({info['train_minutes']} min of training). In the bias framework:\n"
           f"  ModelSpec({str(out_dir)!r}, type='hf-causal-lm', id={args.variant!r}, prompt=load_prompts("
           f"{str(out_dir / 'm2_prompt.yaml')!r})[{prompt.name!r}], settings={{'dtype': {dtype_name!r}}})")

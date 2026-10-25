@@ -163,9 +163,22 @@ The `lm_head.weight` "missing key" warning is harmless: Qwen3-4B ties its input 
   collapsed model's low counterfactual gap means nothing.
 - The full run (~650 steps, ~19 warmup steps) is less exposed.
 
-**To do before the full run:**
-- enforce a minimum warmup;
-- validate before training, to log M0's starting loss;
-- warn when a model collapses, and keep collapsed models out of the takeaway sentence;
-- block disability phrases ("special needs", "mentally ill") instead of single words in the pair rules;
-- fix the training labels ([data README](../data/processed/README.md)).
+**Fixed in `train_lm.py` after this run:**
+- **Minimum warmup:** at least 10 steps, capped at a third of the run (`--min-warmup-steps`). The quick
+  test now warms up for 4 of its 13 steps.
+- **Validation before training:** the log starts with
+  `step 0/N | val loss … (before training: the base model)` and the base model's counterfactual gap.
+  This is the level training must beat.
+- **Collapse check:** a model is flagged as collapsed if:
+  - more than 95% of its validation answers are one class;
+  - its validation AUROC is below 0.6, or more than 0.1 below M0's;
+  - or its best validation loss never beats the step-0 level.
+
+  The flag is printed in a warning box, stored as `collapse_warnings` in `training_summary.json`, and
+  put at the top of the model card. The notebook leaves collapsed models out of the takeaway sentence.
+- **Disability pair rules:** they block phrases ("special needs", "mentally ill", "hard of hearing",
+  "Down's syndrome", …), so common words like "needs", "ill" and "hearing" no longer stop a post from
+  getting a pair.
+
+**Still to do before the full run:** fix the training labels
+([data README](../data/processed/README.md)).

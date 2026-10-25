@@ -95,14 +95,15 @@ pandas reads it directly, or run `gunzip` to get `all_posts.csv` for the trainin
    65% of those are labelled toxic. Needs a stricter language filter.
 3. **The quick-run models collapsed.** M2 fell to near-chance AUROC, and M4 answered "No" to everything.
    With only 13 steps, 3% warmup rounds to zero, so full fine-tuning hit the model at full learning rate.
-   The full run has warmup, but `train_lm.py` should still enforce a minimum warmup, validate before
-   training, and flag collapsed models.
+   **Fixed in `train_lm.py`:** a minimum warmup, validation before training, and a collapse check that
+   warns and keeps collapsed models out of the takeaways (details in
+   [`training/README.md`](training/README.md)).
 4. **Minor:**
    - Possessive gender words ("women's") aren't tagged as gender (148 posts).
-   - M4's disability-pair rules block common words like "needs" and "ill" instead of the phrases
-     "special needs" and "mentally ill".
+   - *Fixed:* M4's disability-pair rules now block phrases ("special needs", "mentally ill"), not the
+     common words "needs" and "ill".
 
-**Next:** fix 1–4, run M2 and M4 in full (about 25 Colab compute units), review the 300 tagged posts,
+**Next:** fix 1, 2 and the possessives in the data notebook, run M2 and M4 in full (about 25 Colab compute units), review the 300 tagged posts,
 run the bias test on M0–M4, and write the final report.
 
 ## References
