@@ -44,8 +44,8 @@ counterfactual loss.
 
 | Path | What it is |
 |-|-|
-| [`Content_Moderation.ipynb`](Content_Moderation.ipynb) | Data pipeline: loads ETHOS + ToxicCommons, cleans, deduplicates, labels, tags gender/disability mentions, splits 70/10/20, samples the 300 verification posts |
-| [`data/processed/`](data/processed) | The pipeline's output: `train/val/test.csv`, `verification_300.csv`, `all_posts.csv.gz` (see its [README](data/processed/README.md)) |
+| [`Content_Moderation.ipynb`](Content_Moderation.ipynb) | Data pipeline: loads ETHOS + Civil Comments (ToxicCommons optional), cleans, deduplicates, labels, tags gender/disability mentions, splits 70/10/20, samples the 300 verification posts |
+| [`data/processed/`](data/processed) | The pipeline's output: `train/val/test.csv`, `verification_300.csv`, `all_posts.csv` (see its [README](data/processed/README.md)) |
 | [`training/`](training) | `train_lm.py` + `Train_M2_M4.ipynb`: trains M2 and M4, compares M0/M2/M4, writes Hugging Face model cards (see its [README](training/README.md)) |
 | [`tagging/`](tagging) | `tag_posts.py` + `Tag_Posts.ipynb`: an 8B LLM tags the swaps and control synonyms of the 300 verification posts; rule checks; review sheet for two humans + Gemini; agreement report |
 | [`docs/`](docs) | Proposal and midterm slides |
@@ -61,50 +61,49 @@ counterfactual loss.
 | 4. Review the tags | Google Sheets (two humans + Gemini), then `finalize` in `Tag_Posts.ipynb` | `verified_posts.jsonl`, agreement |
 | 5. Bias test M0–M4 | `bias-compare-poc/notebooks/bias_study.ipynb` (models as `hf-causal-lm`) | Δ, direction, pairwise comparisons |
 
-Steps 2 and 3 are independent. `all_posts.csv.gz` is gzipped to stay under GitHub's 100 MB file limit.
-pandas reads it directly, or run `gunzip` to get `all_posts.csv` for the training notebook.
+Steps 2 and 3 are independent.
 
 ## Data
 
 | | |
 |-|-|
-| Sources | ETHOS (Mollas et al. 2020; 998 YouTube/Reddit comments, human labels) and ToxicCommons (Arnett et al. 2024; via `tcapelle/ToxicCommons-balanced`, labels by Llama-3.1-8B) |
-| After cleaning | 65,117 posts: train 45,581 / val 6,511 / test 13,025 (stratified, deduplicated across sources) |
-| Categories | gender in 77% of posts, disability in 2.7%, each about 50% toxic |
+| Sources | **Civil Comments** (Borkan et al. 2019; `google/civil_comments`, 1.8M news-site comments, toxicity = share of crowd raters, CC0) and **ETHOS** (Mollas et al. 2020; 998 YouTube/Reddit comments, human labels, GPL-3.0). ToxicCommons is optional and off (see below) |
+| Labels | toxic if at least half the raters said toxic (Civil Comments `toxicity ≥ 0.5`); ETHOS `isHate ≥ 0.5` |
+| Sampling | 60k Civil Comments (half toxic) plus every toxic disability-mentioning comment and as many clean ones |
+| After cleaning | 65,150 posts: train 45,605 / val 6,515 / test 13,030 (stratified, deduplicated across sources), 49.6% toxic |
+| Categories | gender in 37% of posts (56% toxic), disability in 10.4% (48% toxic) |
+| Length | median 38 words; ~127 tokens with the prompt |
 | Verification set | 300 test posts (150 gender + 150 disability) for verified multi-word swaps |
+
+Details, columns and the data review: [`data/processed/README.md`](data/processed/README.md).
 
 ## Status (25 Oct 2026)
 
 **Done**
-- Data pipeline run and its outputs committed.
-- Training (M2, M4) and tagging pipelines built and tested end to end on a tiny stand-in model.
-- A quick run on Colab's A100 80 GB finished, with Qwen3-4B fully fine-tuned on 400 posts: setup,
-  memory check, scoring, counterfactual gaps and the comparison all work. Log:
+- Data pipeline rebuilt on Civil Comments + ETHOS; 26 offline tests pass.
+- Training (M2, M4) and tagging pipelines built and tested end to end on a tiny stand-in model, on
+  the new data too.
+- A quick run on Colab's A100 80 GB (on the old data) finished, with Qwen3-4B fully fine-tuned on 400
+  posts. Setup, memory check, scoring, counterfactual gaps and the comparison all work. Log:
   [`training/results/quicktest_2026-10-25.txt`](training/results/quicktest_2026-10-25.txt).
 
-**Found in the quick run and the data review: fix before the full run**
-1. **Training labels are noisy.**
-   - 68% of ToxicCommons' toxic labels in train (15,132 of 22,128) are on posts ToxicCommons itself
-     rates "clean". They're toxic only because of the pipeline's rule that one category scoring ≥ 2 makes
-     a post toxic.
-   - Samples are newspaper ads, church history and war reports. Even its "mild" and "toxic" tiers are
-     mostly historical text that describes violence.
-   - Options: drop the rule (`TC_AXIS_TOXIC_MIN = None`), or train on human-labelled social media
-     (Civil Comments, as the proposal planned) plus ETHOS.
-2. **12.6% of ToxicCommons training posts aren't English** (German, Dutch, Polish and Latin OCR), and
-   65% of those are labelled toxic. Needs a stricter language filter.
-3. **The quick-run models collapsed.** M2 fell to near-chance AUROC, and M4 answered "No" to everything.
-   With only 13 steps, 3% warmup rounds to zero, so full fine-tuning hit the model at full learning rate.
-   **Fixed in `train_lm.py`:** a minimum warmup, validation before training, and a collapse check that
-   warns and keeps collapsed models out of the takeaways (details in
-   [`training/README.md`](training/README.md)).
-4. **Minor:**
-   - Possessive gender words ("women's") aren't tagged as gender (148 posts).
-   - *Fixed:* M4's disability-pair rules now block phrases ("special needs", "mentally ill"), not the
-     common words "needs" and "ill".
+**Fixed after the quick run and the data review**
+1. **Noisy training labels.** The first build trained on ToxicCommons: OCR'd books and newspapers labelled
+   by an LLM. 68% of its toxic labels in train were on posts it rated "clean" (ads, church history, war
+   news), toxic only through a "one category ≥ 2" rule. Training now uses human-labelled Civil Comments
+   + ETHOS. ToxicCommons can be switched back on (`USE_TOXICCOMMONS = True`) with that rule off.
+2. **Non-English text.** 12.6% of ToxicCommons posts were German, Dutch, Polish or Latin OCR. Civil
+   Comments and ETHOS are English. ToxicCommons, if used, now needs ≥ 15% common English words.
+3. **Possessives.** "women's", "mother's" and similar are now tagged as gender (0 of 297 such posts
+   missed, from 148 missed before).
+4. **Collapsed quick-run models.** Zero warmup on a 13-step run. `train_lm.py` now enforces a minimum
+   warmup, validates before training, and flags collapsed models
+   ([`training/README.md`](training/README.md)).
+5. **M4's disability pairs** block phrases ("special needs", "mentally ill"), not the common words
+   "needs" and "ill".
 
-**Next:** fix 1, 2 and the possessives in the data notebook, run M2 and M4 in full (about 25 Colab compute units), review the 300 tagged posts,
-run the bias test on M0–M4, and write the final report.
+**Next:** re-run the quick test on the new data (it should not collapse), then train M2 and M4 in full.
+After that, tag and review the 300 test posts, run the bias test on M0–M4, and write the final report.
 
 ## References
 

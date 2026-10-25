@@ -35,7 +35,7 @@ would no longer measure ordinary fine-tuning. M1 and M3 (few-shot) need no train
   framework's lexicon swap. Disability adds or removes a disability adjective before a person noun
   ("my cousin" ↔ "my deaf cousin").
 - **Posts without a pair:** posts with slurs or disability words the rules can't swap cleanly, and posts
-  whose hate is aimed at the swapped group (ETHOS targets, ToxicCommons scores ≥ 2, from
+  whose hate is aimed at the swapped group (ETHOS targets, Civil Comments `identity_attack ≥ 0.5`, from
   `all_posts.csv`). Those are the asymmetric cases where a different score is legitimate (Garg et al.,
   2019).
 - **Loss:** `ce + 1.0 × ce(counterfactual, same label) + 0.5 × (log-odds(Yes) original − log-odds(Yes)
@@ -81,7 +81,7 @@ The script estimates memory from the model config before loading anything and st
 change if the run cannot fit. The method used is recorded in `training_summary.json`.
 
 **Training data size.** 20,000 of the ~45,600 training posts for one epoch (all disability posts kept).
-ToxicCommons passages average about 410 tokens, so this keeps a run under about an hour.
+Posts average about 127 tokens with the prompt, so a run takes well under an hour.
 `MAX_TRAIN_SAMPLES = 0` uses everything.
 
 **Both bias categories are in the training data.** The framework tests gender and disability. About 77%
@@ -95,7 +95,7 @@ their natural mix.
 data licences and limitations. The card's example reproduces the framework's score exactly (checked:
 0.344284 vs 0.344285). The notebook's upload cell creates the repo **private** with a write token from
 the `HF_TOKEN` Colab secret, and refuses to upload the quick-test model. The card's licence field is the
-base model's Apache-2.0, but ETHOS is GPL-3.0 and ToxicCommons-balanced lists no licence, so the team
+base model's Apache-2.0, but ETHOS is GPL-3.0 (Civil Comments is CC0), so the team
 should settle the licence before making the repo public.
 
 **No leakage.** The data notebook deduplicates before splitting, and the script checks again that no
@@ -122,10 +122,8 @@ ceiling for human-model agreement.
 
 ## Known limitations
 
-- ToxicCommons is mostly OCR'd public-domain text, not social media, and its labels come from
-  Llama-3.1-8B. Δ uses no labels.
-- About 19% of ToxicCommons passages exceed 512 tokens. Training cuts prompts at 1,024 tokens from the
-  left, and the framework at its `max_length` (default 2,048).
+- Training data is Civil Comments + ETHOS (see the [data README](../data/processed/README.md)). The
+  first quick run below used the earlier ToxicCommons-based data.
 - The disability counterfactual rules are simple (adjective added or removed before a person noun), so
   M4's disability pairs are mostly insertions into posts without disability words. Gender pairs come
   from the same lexicon the framework falls back on.
@@ -180,5 +178,5 @@ The `lm_head.weight` "missing key" warning is harmless: Qwen3-4B ties its input 
   "Down's syndrome", …), so common words like "needs", "ill" and "hearing" no longer stop a post from
   getting a pair.
 
-**Still to do before the full run:** fix the training labels
-([data README](../data/processed/README.md)).
+**Also fixed since:** the training data (now Civil Comments + ETHOS, see the
+[data README](../data/processed/README.md)). Re-run the quick test on it before the full run.

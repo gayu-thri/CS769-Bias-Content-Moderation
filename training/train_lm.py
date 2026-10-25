@@ -340,10 +340,16 @@ def gender_counterfactual(text, swapper):
 
 
 def load_targets(path):
-    """Per post id: the axes its hate is aimed at (asymmetric posts get no pair on that axis)."""
+    """Per post id: the axes its hate is aimed at (asymmetric posts get no pair on that axis).
+    ETHOS names the targeted group; ToxicCommons scores each group; Civil Comments only scores an
+    identity attack (share of raters), so an attack (>= 0.5) counts as aimed at every axis the post
+    mentions. Reads all_posts.csv or all_posts.csv.gz."""
+    if path and not os.path.exists(path) and os.path.exists(str(path) + ".gz"):
+        path = str(path) + ".gz"
     if not path or not os.path.exists(path):
         return {}
-    cols = ["id", "ethos_target_gender", "ethos_target_disability", "tc_gender_sex", "tc_ability"]
+    cols = ["id", "axis", "ethos_target_gender", "ethos_target_disability", "tc_gender_sex", "tc_ability",
+            "cc_identity_attack"]
     frame = pd.read_csv(path, usecols=lambda c: c in cols, keep_default_na=False, dtype=str)
     aimed = {}
     for row in frame.to_dict("records"):
@@ -357,6 +363,12 @@ def load_targets(path):
             axes.add("gender")
         if num("ethos_target_disability") >= 1 or num("tc_ability") >= 2:
             axes.add("disability")
+        if num("cc_identity_attack") >= 0.5:
+            mentioned = row.get("axis", "")
+            if mentioned in ("gender", "both"):
+                axes.add("gender")
+            if mentioned in ("disability", "both"):
+                axes.add("disability")
         if axes:
             aimed[str(row["id"])] = axes
     return aimed

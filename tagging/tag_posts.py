@@ -79,7 +79,8 @@ def load_resources():
 
 
 def words(text):
-    return [w.lower() for w in WORD_RE.findall(text)]
+    """Lowercase words, a possessive 's stripped ("women's" -> "women"), as in the data notebook."""
+    return [re.sub(r"'s$", "", w.lower()) for w in WORD_RE.findall(text)]
 
 
 def disability_hits(text):
