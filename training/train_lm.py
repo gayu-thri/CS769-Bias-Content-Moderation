@@ -108,7 +108,15 @@ def parse_args(argv=None):
     p.add_argument("--max-val-samples", type=int, default=2000, help="val rows (all disability posts kept)")
     p.add_argument("--max-test-samples", type=int, default=3000, help="test rows (all disability posts kept)")
     p.add_argument("--selection-val-samples", type=int, default=500, help="val rows for the loss during training")
-    p.add_argument("--eval-batch-size", type=int, default=8)
+    p.add_argument("--eval-batch-size", default="auto",
+                   help="posts per scoring batch; auto: 32 on GPUs with >= 40 GB, 16 with >= 20 GB, else 8")
+    p.add_argument("--checkpointing", choices=("memory", "disk"), default="memory",
+                   help="memory: keep the best weights in CPU RAM (seconds per evaluation, nothing written); "
+                        "disk: Trainer checkpoints in --checkpoint-dir (16 GB each for a fully fine-tuned 4B "
+                        "model). memory falls back to disk when RAM is short")
+    p.add_argument("--stage-dir", default=None,
+                   help="save the trained model here first (fast local disk), score it from here, then copy it to "
+                        "--output-dir once (e.g. Colab's /content while --output-dir is on Drive)")
     p.add_argument("--require-axes", nargs="*", default=list(BIAS_AXES),
                    help="stop unless train has toxic and clean posts mentioning each of these axes")
     p.add_argument("--min-axis-share", nargs="*", default=[], metavar="AXIS=FRACTION",
@@ -747,6 +755,64 @@ def make_gap_callback(pairs, render, tokenizer, chat, max_length, answer_ids, to
     return Gap()
 
 
+def make_best_in_memory_callback(patience, dtype_name):
+    """Keeps the trainable weights of the best validation-loss evaluation in CPU RAM and stops
+    after `patience` evaluations without improvement: the Trainer's best-checkpoint logic
+    without writing a checkpoint to disk (16 GB each for a fully fine-tuned 4B model)."""
+    from transformers import TrainerCallback
+    import torch
+
+    snapshot_dtype = getattr(torch, dtype_name)
+
+    class BestInMemory(TrainerCallback):
+        best_loss = None
+        best_step = None
+        weights = None
+        bad = 0
+
+        def on_evaluate(self, args, state, control, metrics=None, model=None, **kwargs):
+            loss = (metrics or {}).get("eval_loss")
+            if loss is None or model is None or state.global_step == 0:  # step 0 is the base model
+                return
+            if self.best_loss is None or loss < self.best_loss - 1e-6:
+                start = time.time()
+                self.best_loss, self.best_step, self.bad = loss, state.global_step, 0
+                self.weights = {name: p.detach().to("cpu", dtype=snapshot_dtype if p.is_floating_point() else p.dtype,
+                                                    copy=True)
+                                for name, p in model.named_parameters() if p.requires_grad}
+                print(f"step {state.global_step}/{state.max_steps} | new best val loss {loss:.4f}: weights kept in RAM "
+                      f"({time.time() - start:.0f} s)", flush=True)
+            else:
+                self.bad += 1
+                if self.bad >= patience:
+                    print(f"step {state.global_step}/{state.max_steps} | no improvement for {patience} evaluations: "
+                          "stopping early", flush=True)
+                    control.should_training_stop = True
+
+        def restore(self, model):
+            if self.weights is None:
+                return False
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if name in self.weights:
+                        p.copy_(self.weights[name].to(p.device, dtype=p.dtype))
+            return True
+
+    return BestInMemory()
+
+
+def enough_ram_for_snapshot(model, dtype_name):
+    import torch
+
+    try:
+        import psutil
+    except ImportError:
+        return False
+    per = torch.tensor([], dtype=getattr(torch, dtype_name)).element_size()
+    need = sum(p.numel() for p in model.parameters() if p.requires_grad) * per
+    return psutil.virtual_memory().available > need * 1.5 + 2 * 2**30
+
+
 def make_trainer_class(answer_ids):
     from transformers import Trainer
     import torch
@@ -865,6 +931,17 @@ def plan_method(args, dtype_name, token):
     return method, resolve_optim(args.optim, method, use_cuda)
 
 
+def resolve_eval_batch_size(value, device):
+    if str(value) != "auto":
+        return int(value)
+    import torch
+
+    if device != "cpu" and torch.cuda.is_available():
+        gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+        return 32 if gb >= 40 else 16 if gb >= 20 else 8
+    return 8
+
+
 def resolve_dtype(name):
     import torch
 
@@ -888,7 +965,7 @@ def load_lm(path, dtype_name, token, device_map):
     return AutoModelForCausalLM.from_pretrained(path, **kwargs)
 
 
-def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir, gap_pairs=None):
+def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir, gap_pairs=None, model_dir=None):
     import torch
     import transformers
     from peft import LoraConfig, get_peft_model
@@ -941,6 +1018,11 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
         for param in model.parameters():  # LoRA weights in float32, so float16 AMP can unscale them
             if param.requires_grad and param.dtype != torch.float32:
                 param.data = param.data.float()
+    checkpointing = args.checkpointing
+    if checkpointing == "memory" and not enough_ram_for_snapshot(model, dtype_name):
+        print("NOTE: not enough free RAM to keep the best weights in memory; using disk checkpoints in "
+              f"{checkpoint_dir}")
+        checkpointing = "disk"
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
     print(f"trainable parameters: {n_train:,} of {n_all:,} ({n_train / n_all:.1%}); optimizer {optim}")
@@ -953,7 +1035,7 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     warmup_steps = max(int(round(args.warmup_ratio * total_steps)), min(args.min_warmup_steps, max(1, total_steps // 3)))
     targs = dict(
         output_dir=str(checkpoint_dir), per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size, gradient_accumulation_steps=args.grad_accum,
+        per_device_eval_batch_size=args.eval_batch_size, gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr, optim=optim, num_train_epochs=args.epochs, weight_decay=args.weight_decay,
         warmup_steps=warmup_steps, lr_scheduler_type="cosine",
         logging_steps=max(1, min(10, eval_steps)), eval_steps=eval_steps, save_steps=eval_steps,
@@ -968,7 +1050,11 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
         targs["use_cpu" if "use_cpu" in accepted else "no_cuda"] = True
     targs["eval_strategy" if "eval_strategy" in accepted else "evaluation_strategy"] = "steps"
     # Batches of similar length: much less padding. transformers 5 renamed the option.
-    if args.method == "full" and "save_only_model" in accepted:
+    if checkpointing == "memory":  # the BestInMemory callback keeps the best weights; nothing is written
+        targs.update(save_strategy="no", load_best_model_at_end=False)
+        targs.pop("save_steps", None)
+        targs.pop("save_total_limit", None)
+    elif args.method == "full" and "save_only_model" in accepted:
         targs["save_only_model"] = True  # checkpoints without optimizer states: ~half the disk and time
     if "train_sampling_strategy" in accepted:
         targs["train_sampling_strategy"] = "group_by_length"
@@ -980,7 +1066,8 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
 
     trainer_cls = make_trainer_class(answer_ids)
     progress = make_progress_callback()
-    callbacks = [EarlyStoppingCallback(early_stopping_patience=args.patience), progress]
+    best_in_memory = make_best_in_memory_callback(args.patience, dtype_name) if checkpointing == "memory" else None
+    callbacks = [best_in_memory or EarlyStoppingCallback(early_stopping_patience=args.patience), progress]
     gap = None
     if gap_pairs is not None and len(gap_pairs):
         gap = make_gap_callback(gap_pairs, render, tokenizer, chat, args.max_length, answer_ids, toxic_index,
@@ -1011,9 +1098,16 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     output = trainer.train()
     minutes = (time.time() - start) / 60
     state = trainer.state
+    if best_in_memory is not None and best_in_memory.restore(trainer.model):
+        print(f"Restored the best weights (step {best_in_memory.best_step}, val loss {best_in_memory.best_loss:.4f})")
+    best_val_loss = best_in_memory.best_loss if best_in_memory is not None else state.best_metric
+    best_checkpoint = (f"in memory: step {best_in_memory.best_step}" if best_in_memory is not None
+                       else state.best_model_checkpoint)
+    model_dir = Path(model_dir or out_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     if args.method == "lora":
-        trainer.model.save_pretrained(str(out_dir / "lora_adapter"))  # the adapter alone, before merging
+        trainer.model.save_pretrained(str(model_dir / "lora_adapter"))  # the adapter alone, before merging
         print("Merging the LoRA adapter into the base weights ...")
         merged = trainer.model.merge_and_unload()
     else:
@@ -1021,13 +1115,13 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     if dtype_name != "float32":
         merged = merged.to(getattr(torch, dtype_name))  # saved in 16-bit: half the size on Drive
     merged.config.use_cache = True
-    merged.save_pretrained(str(out_dir), safe_serialization=True)
-    tokenizer.save_pretrained(str(out_dir))
+    merged.save_pretrained(str(model_dir), safe_serialization=True)
+    tokenizer.save_pretrained(str(model_dir))
 
     info = {"method": args.method, "optimizer": optim, "learning_rate": args.lr, "warmup_steps": warmup_steps,
             "val_loss_before": val_loss_before,
             "trainable_parameters": n_train, "train_loss": output.training_loss, "train_minutes": round(minutes, 1),
-            "best_checkpoint": state.best_model_checkpoint, "best_val_loss": state.best_metric,
+            "best_checkpoint": best_checkpoint, "best_val_loss": best_val_loss, "checkpointing": checkpointing,
             "optimizer_steps": state.global_step, "log_history": state.log_history,
             "answer_tokens": dict(zip(answers, tokenizer.convert_ids_to_tokens(answer_ids))),
             "inputs_truncated": truncated, "mean_tokens": float(np.mean(lengths["train"])),
@@ -1242,6 +1336,7 @@ def main(argv=None):
     if args.lr is None:
         args.lr = 1e-5 if args.method == "full" else 2e-4
     args.variant = args.variant or ("M4" if args.counterfactual else "M2")
+    args.eval_batch_size = resolve_eval_batch_size(args.eval_batch_size, args.device)
 
     full = {"train": load_split(args.train), "val": load_split(args.val)}
     if args.test:
@@ -1305,10 +1400,12 @@ def main(argv=None):
         record("M0", framework_scores(args.base_model, prompt, task, to_score, args, dtype_name, token))
         print("M0 val: " + json.dumps({k: round(v, 4) for k, v in results["M0"]["val"]["overall"].items()}))
 
-    info = train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir, gap_pairs=cf_eval.get("val"))
+    model_dir = Path(args.stage_dir) / args.variant.lower() if args.stage_dir else out_dir
+    info = train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir, gap_pairs=cf_eval.get("val"),
+                 model_dir=model_dir)
 
-    print(f"\nScoring {args.variant} with the framework's LLM adapter ...")
-    record(args.variant, framework_scores(out_dir, prompt, task, to_score, args, dtype_name, None))
+    print(f"\nScoring {args.variant} with the framework's LLM adapter (batches of {args.eval_batch_size}) ...")
+    record(args.variant, framework_scores(model_dir, prompt, task, to_score, args, dtype_name, None))
     collapsed = collapse_warnings(results[args.variant]["val"]["overall"],
                                   results.get("M0", {}).get("val", {}).get("overall"),
                                   info.get("val_loss_before"), info.get("best_val_loss"))
@@ -1346,6 +1443,12 @@ def main(argv=None):
     with open(out_dir / "training_summary.json", "w") as handle:
         json.dump(summary, handle, indent=2, default=str)
     (out_dir / "README.md").write_text(model_card(summary, prompt, task, args.card_license), encoding="utf-8")
+    if model_dir != out_dir:  # one copy of the model to the output folder (Drive), after scoring from local disk
+        start = time.time()
+        print(f"Copying {args.variant} from {model_dir} to {out_dir} ...", flush=True)
+        shutil.copytree(model_dir, out_dir, dirs_exist_ok=True)
+        shutil.rmtree(model_dir, ignore_errors=True)
+        print(f"  copied in {(time.time() - start) / 60:.1f} min")
     if not args.keep_checkpoints:
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
 

@@ -80,15 +80,25 @@ correct answer token at exactly that position. M0 and M2 are then scored with th
 The script estimates memory from the model config before loading anything and stops with what to
 change if the run cannot fit. The method used is recorded in `training_summary.json`.
 
-**Training data size.** 20,000 of the ~45,600 training posts for one epoch (all disability posts kept).
+**Fast checkpointing and scoring.** These options cut each run by roughly 15–30 minutes on Colab.
+- **Best weights in RAM** (`--checkpointing memory`, the default). When validation loss improves, the
+  trainable weights are copied to CPU RAM: about 8 GB in seconds, with no 16 GB checkpoint file written.
+  The run stops early after `--patience` evaluations without improvement, and the best weights are
+  restored at the end. If RAM is short it falls back to Trainer checkpoints on disk
+  (`--checkpointing disk`). Tested: both modes reach the same best validation loss, and restored weights
+  equal the saved ones.
+- **Local staging** (`--stage-dir`). The finished model is saved to Colab's local disk, scored from there,
+  then copied to Drive once, instead of being read back from Drive.
+- **GPU-sized scoring batches** (`--eval-batch-size auto`): 32 posts on GPUs with 40 GB or more.
+
+**Training data size.** 20,000 of the ~44,200 training posts for one epoch (all disability posts kept).
 Posts average about 125 tokens with the prompt, so a run takes well under an hour.
 `MAX_TRAIN_SAMPLES = 0` uses everything.
 
-**Both bias categories are in the training data.** The framework tests gender and disability. About 77%
-of training posts mention gender but only about 2.7% (~1,230) mention disability, each category about 50%
-toxic. The script prints this mix and stops if train lacks toxic or clean posts for either category.
-Disability posts are repeated (half toxic, half clean) to 10% of the training rows. Val and test keep
-their natural mix.
+**Both bias categories are in the training data.** The framework tests gender and disability. About 36%
+of training posts mention gender (56% toxic) and 8% (3,555) mention disability (48% toxic). The script
+prints this mix and stops if train lacks toxic or clean posts for either category. Disability posts are
+repeated (half toxic, half clean) to 10% of the training rows. Val and test keep their natural mix.
 
 **Uploadable to Hugging Face.** `m2/` is a complete model repo: weights, tokenizer and a model card
 (`README.md`). The card covers what M2 is, a usage example, the training settings, M0 vs M2 metrics,
