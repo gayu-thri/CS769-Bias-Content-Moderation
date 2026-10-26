@@ -95,8 +95,9 @@ def parse_args(argv=None):
     p.add_argument("--min-warmup-steps", type=int, default=10,
                    help="warmup at least this many optimizer steps (capped at a third of the run), so short runs "
                         "never start at the full learning rate")
-    p.add_argument("--eval-steps", type=int, default=100, help="validation loss every N optimizer steps")
-    p.add_argument("--patience", type=int, default=3, help="early stopping, in evaluations without improvement")
+    p.add_argument("--eval-steps", type=int, default=100,
+                   help="validation loss and counterfactual gap every N optimizer steps, for the curves only: "
+                        "training always runs all --epochs and keeps the final weights (no early stopping)")
     p.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto",
                    help="auto: bfloat16 where the GPU supports it (L4, A100), else float16 (T4), float32 on CPU")
     p.add_argument("--no-gradient-checkpointing", action="store_true")
@@ -110,10 +111,6 @@ def parse_args(argv=None):
     p.add_argument("--selection-val-samples", type=int, default=500, help="val rows for the loss during training")
     p.add_argument("--eval-batch-size", default="auto",
                    help="posts per scoring batch; auto: 32 on GPUs with >= 40 GB, 16 with >= 20 GB, else 8")
-    p.add_argument("--checkpointing", choices=("memory", "disk"), default="memory",
-                   help="memory: keep the best weights in CPU RAM (seconds per evaluation, nothing written); "
-                        "disk: Trainer checkpoints in --checkpoint-dir (16 GB each for a fully fine-tuned 4B "
-                        "model). memory falls back to disk when RAM is short")
     p.add_argument("--tensorboard-dir", default=None,
                    help="write TensorBoard logs here (one subfolder per run): train and validation loss, learning "
                         "rate, M4's loss parts and the validation counterfactual gap")
@@ -134,8 +131,8 @@ def parse_args(argv=None):
                    help="with --skip-baseline: copy M0's metrics from an earlier run's output folder (same data, "
                         "seed and sample sizes), so this run's tables and model card include M0")
     p.add_argument("--checkpoint-dir", default=None,
-                   help="intermediate adapter checkpoints (default: <output-dir>/checkpoints); on Colab use local disk")
-    p.add_argument("--keep-checkpoints", action="store_true")
+                   help="the Trainer's scratch folder, deleted at the end; no checkpoints are written "
+                        "(default: <output-dir>/checkpoints)")
     p.add_argument("--counterfactual", action="store_true",
                    help="train M4: add the counterfactual loss (augmentation + logit pairing) on gender and "
                         "disability swaps of the training posts")
@@ -760,64 +757,6 @@ def make_gap_callback(pairs, render, tokenizer, chat, max_length, answer_ids, to
     return Gap()
 
 
-def make_best_in_memory_callback(patience, dtype_name):
-    """Keeps the trainable weights of the best validation-loss evaluation in CPU RAM and stops
-    after `patience` evaluations without improvement: the Trainer's best-checkpoint logic
-    without writing a checkpoint to disk (16 GB each for a fully fine-tuned 4B model)."""
-    from transformers import TrainerCallback
-    import torch
-
-    snapshot_dtype = getattr(torch, dtype_name)
-
-    class BestInMemory(TrainerCallback):
-        best_loss = None
-        best_step = None
-        weights = None
-        bad = 0
-
-        def on_evaluate(self, args, state, control, metrics=None, model=None, **kwargs):
-            loss = (metrics or {}).get("eval_loss")
-            if loss is None or model is None or state.global_step == 0:  # step 0 is the base model
-                return
-            if self.best_loss is None or loss < self.best_loss - 1e-6:
-                start = time.time()
-                self.best_loss, self.best_step, self.bad = loss, state.global_step, 0
-                self.weights = {name: p.detach().to("cpu", dtype=snapshot_dtype if p.is_floating_point() else p.dtype,
-                                                    copy=True)
-                                for name, p in model.named_parameters() if p.requires_grad}
-                print(f"step {state.global_step}/{state.max_steps} | new best val loss {loss:.4f}: weights kept in RAM "
-                      f"({time.time() - start:.0f} s)", flush=True)
-            else:
-                self.bad += 1
-                if self.bad >= patience:
-                    print(f"step {state.global_step}/{state.max_steps} | no improvement for {patience} evaluations: "
-                          "stopping early", flush=True)
-                    control.should_training_stop = True
-
-        def restore(self, model):
-            if self.weights is None:
-                return False
-            with torch.no_grad():
-                for name, p in model.named_parameters():
-                    if name in self.weights:
-                        p.copy_(self.weights[name].to(p.device, dtype=p.dtype))
-            return True
-
-    return BestInMemory()
-
-
-def enough_ram_for_snapshot(model, dtype_name):
-    import torch
-
-    try:
-        import psutil
-    except ImportError:
-        return False
-    per = torch.tensor([], dtype=getattr(torch, dtype_name)).element_size()
-    need = sum(p.numel() for p in model.parameters() if p.requires_grad) * per
-    return psutil.virtual_memory().available > need * 1.5 + 2 * 2**30
-
-
 def make_trainer_class(answer_ids):
     from transformers import Trainer
     import torch
@@ -984,7 +923,7 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     import torch
     import transformers
     from peft import LoraConfig, get_peft_model
-    from transformers import AutoTokenizer, EarlyStoppingCallback, TrainingArguments, set_seed
+    from transformers import AutoTokenizer, TrainingArguments, set_seed
     from biascompare.scoring.causal_lm import _render
 
     set_seed(args.seed)
@@ -1033,11 +972,6 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
         for param in model.parameters():  # LoRA weights in float32, so float16 AMP can unscale them
             if param.requires_grad and param.dtype != torch.float32:
                 param.data = param.data.float()
-    checkpointing = args.checkpointing
-    if checkpointing == "memory" and not enough_ram_for_snapshot(model, dtype_name):
-        print("NOTE: not enough free RAM to keep the best weights in memory; using disk checkpoints in "
-              f"{checkpoint_dir}")
-        checkpointing = "disk"
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
     print(f"trainable parameters: {n_train:,} of {n_all:,} ({n_train / n_all:.1%}); optimizer {optim}")
@@ -1053,9 +987,10 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
         per_device_eval_batch_size=args.eval_batch_size, gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr, optim=optim, num_train_epochs=args.epochs, weight_decay=args.weight_decay,
         warmup_steps=warmup_steps, lr_scheduler_type="cosine",
-        logging_steps=max(1, min(10, eval_steps)), eval_steps=eval_steps, save_steps=eval_steps,
-        save_strategy="steps", load_best_model_at_end=True, metric_for_best_model="eval_loss",
-        greater_is_better=False, save_total_limit=2, seed=args.seed, report_to="none", logging_first_step=True,
+        logging_steps=max(1, min(10, eval_steps)), eval_steps=eval_steps,
+        # No early stopping and no checkpoints: every run trains all epochs and keeps the final weights, so
+        # M2 and M4 see the same posts and the same learning-rate schedule to the end.
+        save_strategy="no", load_best_model_at_end=False, seed=args.seed, report_to="none", logging_first_step=True,
         bf16=use_cuda and dtype_name == "bfloat16", fp16=use_cuda and dtype_name == "float16",
         remove_unused_columns=False, label_names=["labels"], prediction_loss_only=True,
         dataloader_num_workers=2 if use_cuda else 0, max_grad_norm=1.0, disable_tqdm=True,
@@ -1075,12 +1010,6 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
         targs["use_cpu" if "use_cpu" in accepted else "no_cuda"] = True
     targs["eval_strategy" if "eval_strategy" in accepted else "evaluation_strategy"] = "steps"
     # Batches of similar length: much less padding. transformers 5 renamed the option.
-    if checkpointing == "memory":  # the BestInMemory callback keeps the best weights; nothing is written
-        targs.update(save_strategy="no", load_best_model_at_end=False)
-        targs.pop("save_steps", None)
-        targs.pop("save_total_limit", None)
-    elif args.method == "full" and "save_only_model" in accepted:
-        targs["save_only_model"] = True  # checkpoints without optimizer states: ~half the disk and time
     if "train_sampling_strategy" in accepted:
         targs["train_sampling_strategy"] = "group_by_length"
     elif "group_by_length" in accepted:
@@ -1091,8 +1020,7 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
 
     trainer_cls = make_trainer_class(answer_ids)
     progress = make_progress_callback()
-    best_in_memory = make_best_in_memory_callback(args.patience, dtype_name) if checkpointing == "memory" else None
-    callbacks = [best_in_memory or EarlyStoppingCallback(early_stopping_patience=args.patience), progress]
+    callbacks = [progress]
     gap = None
     if gap_pairs is not None and len(gap_pairs):
         gap = make_gap_callback(gap_pairs, render, tokenizer, chat, args.max_length, answer_ids, toxic_index,
@@ -1126,11 +1054,15 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     output = trainer.train()
     minutes = (time.time() - start) / 60
     state = trainer.state
-    if best_in_memory is not None and best_in_memory.restore(trainer.model):
-        print(f"Restored the best weights (step {best_in_memory.best_step}, val loss {best_in_memory.best_loss:.4f})")
-    best_val_loss = best_in_memory.best_loss if best_in_memory is not None else state.best_metric
-    best_checkpoint = (f"in memory: step {best_in_memory.best_step}" if best_in_memory is not None
-                       else state.best_model_checkpoint)
+    # The kept model is the final one; evaluate it unless the last step already did (one more curve point).
+    evals = {e["step"]: e["eval_loss"] for e in state.log_history if "eval_loss" in e}
+    val_loss_after = evals.get(state.global_step)
+    if val_loss_after is None:
+        val_loss_after = trainer.evaluate().get("eval_loss")
+        evals[state.global_step] = val_loss_after
+    best_step = min(evals, key=evals.get) if evals else None
+    print(f"step {state.global_step}/{total_steps} | final val loss {val_loss_after:.4f} (kept: the final weights; "
+          f"lowest was {evals[best_step]:.4f} at step {best_step})", flush=True)
     model_dir = Path(model_dir or out_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1149,7 +1081,8 @@ def train(args, prompt, task, frames, token, dtype_name, out_dir, checkpoint_dir
     info = {"method": args.method, "optimizer": optim, "learning_rate": args.lr, "warmup_steps": warmup_steps,
             "val_loss_before": val_loss_before,
             "trainable_parameters": n_train, "train_loss": output.training_loss, "train_minutes": round(minutes, 1),
-            "best_checkpoint": best_checkpoint, "best_val_loss": best_val_loss, "checkpointing": checkpointing,
+            "kept_weights": f"final (step {state.global_step})", "val_loss_after": val_loss_after,
+            "lowest_val_loss": evals.get(best_step), "lowest_val_loss_step": best_step,
             "optimizer_steps": state.global_step, "log_history": pre_train_logs + list(state.log_history),
             "answer_tokens": dict(zip(answers, tokenizer.convert_ids_to_tokens(answer_ids))),
             "inputs_truncated": truncated, "mean_tokens": float(np.mean(lengths["train"])),
@@ -1207,7 +1140,7 @@ def save_training_curves(log_history, path, title):
 
 # ---------------------------------------------------------------- collapse check
 
-def collapse_warnings(trained, baseline=None, val_loss_before=None, best_val_loss=None):
+def collapse_warnings(trained, baseline=None, val_loss_before=None, val_loss_after=None):
     """Reasons a trained model looks collapsed (it ignores its input), from its validation metrics.
     A collapsed model's counterfactual gap is near zero because it gives every post the same answer,
     not because it is unbiased, so its bias numbers must not be read as results."""
@@ -1224,8 +1157,8 @@ def collapse_warnings(trained, baseline=None, val_loss_before=None, best_val_los
     base_auroc = (baseline or {}).get("auroc")
     if auroc is not None and base_auroc is not None and auroc < base_auroc - 0.1:
         reasons.append(f"validation AUROC fell from {base_auroc:.2f} (M0) to {auroc:.2f}")
-    if val_loss_before is not None and best_val_loss is not None and best_val_loss >= val_loss_before - 1e-3:
-        reasons.append(f"best validation loss {best_val_loss:.4f} never improved on the base model's "
+    if val_loss_before is not None and val_loss_after is not None and val_loss_after >= val_loss_before - 1e-3:
+        reasons.append(f"final validation loss {val_loss_after:.4f} is no better than the base model's "
                        f"{val_loss_before:.4f}")
     return reasons
 
@@ -1350,10 +1283,10 @@ this repo is the prompt to score it with.
 | Base model (M0) | `{summary['base_model']}` |
 | Method | {method}, lr {summary['learning_rate']}, {summary['optimizer']}, {summary['dtype']} |
 | Objective | cross-entropy on the first token of the correct answer ({answers[1]!r} = toxic, {answers[0]!r} = not toxic) after the prompt above.{objective_extra} |
-| Data | {summary['rows']['train']:,} training rows from the project's train split (ETHOS + ToxicCommons, English, deduplicated), {('oversampled: ' + ', '.join(hp['min_axis_share'])) if hp.get('min_axis_share') else 'natural category mix'} |
+| Data | {summary['rows']['train']:,} training rows from the project's train split (Civil Comments + ETHOS, English, deduplicated), {('oversampled: ' + ', '.join(hp['min_axis_share'])) if hp.get('min_axis_share') else 'natural category mix'} |
 | Epochs / effective batch | {hp['epochs']} / {hp['batch_size'] * hp['grad_accum']} |
 | Max prompt length | {summary['max_length']} tokens (cut from the left) |
-| Selection | best validation loss, checked every {hp['eval_steps']} steps |
+| Selection | none: the weights after the last step (no early stopping); validation loss logged every {hp['eval_steps']} steps |
 | Steps / time | {summary['optimizer_steps']} steps, {summary['train_minutes']} min on {summary['environment']['gpu']} |
 
 ## Evaluation (M0 = base model, {variant} = this model)
@@ -1531,7 +1464,7 @@ def main(argv=None):
     record(args.variant, framework_scores(model_dir, prompt, task, to_score, args, dtype_name, None))
     collapsed = collapse_warnings(results[args.variant]["val"]["overall"],
                                   results.get("M0", {}).get("val", {}).get("overall"),
-                                  info.get("val_loss_before"), info.get("best_val_loss"))
+                                  info.get("val_loss_before"), info.get("val_loss_after"))
 
     for s, frame in eval_frames.items():
         keep = [c for c in ("id", "source", "axis", "label") if c in frame.columns]
@@ -1577,8 +1510,7 @@ def main(argv=None):
         shutil.copytree(model_dir, out_dir, dirs_exist_ok=True)
         shutil.rmtree(model_dir, ignore_errors=True)
         print(f"  copied in {(time.time() - start) / 60:.1f} min")
-    if not args.keep_checkpoints:
-        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+    shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
     shown = ["model", "split", "group", "n", "accuracy", "macro_f1", "auroc", "fpr", "fnr", "option_mass"]
     with pd.option_context("display.width", 180, "display.max_rows", 200):

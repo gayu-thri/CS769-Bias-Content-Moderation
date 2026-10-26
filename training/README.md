@@ -25,9 +25,9 @@ Drive folder. The notebook finds that folder and writes `m2/`, `m4/` and `compar
 | M2 | ordinary fine-tuning | the proposal's question: what does ordinary fine-tuning do to bias? |
 | M4 | the same fine-tuning plus a counterfactual loss | does training on counterfactuals reduce bias beyond that, and at what accuracy cost? |
 
-M2 and M4 share posts, prompt, hyperparameters and checkpoint selection (ordinary validation loss), so their
-difference is the loss alone. M2 stays a plain control: if it were trained to be swap-invariant, M2 vs M0
-would no longer measure ordinary fine-tuning. M1 and M3 (few-shot) need no training.
+M2 and M4 share posts, prompt and hyperparameters, and both train for the full epoch and keep the final
+weights (no early stopping), so their difference is the loss alone. M2 stays a plain control: if it were
+trained to be swap-invariant, M2 vs M0 would no longer measure ordinary fine-tuning. M1 and M3 (few-shot) need no training.
 
 **M4's counterfactual loss.**
 
@@ -80,13 +80,16 @@ correct answer token at exactly that position. M0 and M2 are then scored with th
 The script estimates memory from the model config before loading anything and stops with what to
 change if the run cannot fit. The method used is recorded in `training_summary.json`.
 
-**Fast checkpointing and scoring.** These options cut each run by roughly 15–30 minutes on Colab.
-- **Best weights in RAM** (`--checkpointing memory`, the default). When validation loss improves, the
-  trainable weights are copied to CPU RAM: about 8 GB in seconds, with no 16 GB checkpoint file written.
-  The run stops early after `--patience` evaluations without improvement, and the best weights are
-  restored at the end. If RAM is short it falls back to Trainer checkpoints on disk
-  (`--checkpointing disk`). Tested: both modes reach the same best validation loss, and restored weights
-  equal the saved ones.
+**No early stopping; the final weights are kept.** Every run trains all `--epochs` (625 steps for 20,000
+posts at batch 32) whatever the validation loss does. An earlier version stopped after 3 evaluations
+without a lower validation loss: on the first full run that kept M2's step-100 weights (3,200 posts seen,
+learning rate still near its peak), decided by a single noisy evaluation. Validation loss and the
+counterfactual gap are still logged every `--eval-steps` for the curves, and the final weights are
+evaluated once more if the last step wasn't an evaluation step. `training_summary.json` records
+`kept_weights`, `val_loss_after` and, for reference, the lowest validation loss and its step. No
+checkpoints are written, which also saves the 16 GB checkpoint files of a fully fine-tuned 4B model.
+
+**Fast scoring.**
 - **Local staging** (`--stage-dir`). The finished model is saved to Colab's local disk, scored from there,
   then copied to Drive once, instead of being read back from Drive.
 - **GPU-sized scoring batches** (`--eval-batch-size auto`): 32 posts on GPUs with 40 GB or more.
@@ -200,7 +203,7 @@ The `lm_head.weight` "missing key" warning is harmless: Qwen3-4B ties its input 
 - **Collapse check:** a model is flagged as collapsed if:
   - more than 95% of its validation answers are one class;
   - its validation AUROC is below 0.6, or more than 0.1 below M0's;
-  - or its best validation loss never beats the step-0 level.
+  - or its final validation loss is no better than the step-0 level.
 
   The flag is printed in a warning box, stored as `collapse_warnings` in `training_summary.json`, and
   put at the top of the model card. The notebook leaves collapsed models out of the takeaway sentence.
