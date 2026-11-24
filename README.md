@@ -47,7 +47,7 @@ counterfactual loss.
 | [`Content_Moderation.ipynb`](Content_Moderation.ipynb) | Data pipeline: loads ETHOS + Civil Comments (ToxicCommons optional), cleans, deduplicates, labels, tags gender/disability mentions, splits 70/10/20, samples the 300 verification posts |
 | [`data/processed/`](data/processed) | The pipeline's output: `train/val/test.csv`, `verification_300.csv`, `all_posts.csv` (see its [README](data/processed/README.md)) |
 | [`training/`](training) | `train_lm.py` + `Train_M2_M4.ipynb`: trains M2 and M4, compares M0/M2/M4, writes Hugging Face model cards (see its [README](training/README.md)) |
-| [`tagging/`](tagging) | `tag_posts.py` + `Tag_Posts.ipynb`: an 8B LLM tags the swaps and control synonyms of the 300 verification posts; rule checks; review sheet for two humans + Gemini; agreement report |
+| [`tagging/`](tagging) | `tag_posts.py` + `Tag_Posts.ipynb`: an 8B LLM tags the swaps and control synonyms of the 300 verification posts; rule checks; review sheet for two humans + Gemini; agreement report. `twins` writes one LLM twin per train/test post and axis, for M4 and the transfer test |
 | [`docs/`](docs) | Proposal and midterm slides |
 | `src/`, `poc.ipynb`, `DESIGN.md`, `tests/` | **Legacy**: the original 10-post proof of concept of the bias framework. The current framework (M0–M4, gender + disability, LLM scoring) lives in [`shreyasnat2804/bias-compare-poc`](https://github.com/shreyasnat2804/bias-compare-poc), branch `claude/testing-framework-llm-bert-njfxy2` |
 
@@ -56,12 +56,13 @@ counterfactual loss.
 | Step | Run | Output |
 |-|-|-|
 | 1. Build the data | `Content_Moderation.ipynb` (CPU, High-RAM; `SAVE_TO_DRIVE = True`) | the splits, or use `data/processed/` from this repo |
+| 1b. LLM twins | section 6 of `tagging/Tag_Posts.ipynb` (GPU): `tag_posts.py twins` on `train.csv` and `test.csv` | `twins_train.csv` (for M4 with LLM twins), `twins_test.csv` (transfer test, 100-row check) |
 | 2. Train M2 and M4 | `training/Train_M2_M4.ipynb` on the **80 GB GPU**, with `train_lm.py` and the CSVs in the same Drive folder | `m2/`, `m4/`, `comparison/` |
 | 3. Tag 300 test posts | `tagging/Tag_Posts.ipynb` (GPU) | `tagged_posts.jsonl`, `tagging_review.csv` |
 | 4. Review the tags | Google Sheets (two humans + Gemini), then `finalize` in `Tag_Posts.ipynb` | `verified_posts.jsonl`, agreement |
 | 5. Bias test M0–M4 | `bias-compare-poc/notebooks/bias_study.ipynb` (models as `hf-causal-lm`) | Δ, direction, pairwise comparisons |
 
-Steps 2 and 3 are independent.
+Steps 2 and 3 are independent. M4 with LLM twins needs step 1b first; M2 and M4 with rule twins don't.
 
 ## Data
 

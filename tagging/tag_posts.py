@@ -1,4 +1,4 @@
-"""LLM tagging of held-out posts: targeted swaps and control synonyms.
+"""LLM tagging: swaps and control synonyms for the bias test, twins for training.
 
 The proposal's tagging step. An 8B LLM (default Qwen3-8B) tags each post, per
 bias axis it mentions, with
@@ -27,16 +27,41 @@ The output rows are in the biascompare v1 format (bias-compare-poc docs/DATA.md
 §2.2-2.3). The dataset's toxicity label goes in `meta.dataset_label`, never in
 `label`: the evaluated posts need no label, and ToxicCommons labels are
 model-derived.
+
+Twins (counterfactuals for training M4 and for the transfer test). The rule
+twins in train_lm.py cover only 3% of real disability posts, and most of M4's
+disability twins insert a word into a post that never mentioned disability.
+`twins` asks the LLM for one twin per post and axis instead: every gendered
+word about a person swapped (both genders, so mixed posts work too), or every
+disability marker about a person removed. The LLM also says when there is no
+twin: the word is not about a person, is figurative or an insult, or the post
+only makes sense for that group. Rule checks run on every twin; `twin_ok`
+marks the ones a training run can use. Replies are saved as they come, so a
+stopped Colab run resumes where it left off.
+
+    # 3. twins: every train (or test) post the lexicon tagged -> twins_train.csv
+    python tagging/tag_posts.py twins --input data/processed/train.csv --out out/twins_train.csv
+    python tagging/tag_posts.py twins --input data/processed/test.csv --out out/twins_test.csv
+
+    # 4. a 100-row sheet for two reviewers, then their agreement (Cohen's kappa)
+    python tagging/tag_posts.py twins-sheet --twins out/twins_test.csv --out out/twins_check.csv
+    python tagging/tag_posts.py twins-agree --sheet out/twins_check_filled.csv
+
+`load_twins(path)` returns {post id: [(axis, twin text, group), ...]} for a
+training run (see its docstring).
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import importlib.resources
 import json
+import math
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -67,11 +92,15 @@ def _resource(name):
     return json.loads((importlib.resources.files("biascompare") / "resources" / name).read_text(encoding="utf-8"))
 
 
-def load_resources():
+def gender_sets():
+    """The framework's gender lexicon as two word sets. All `twins` needs, so it runs without stopwords.json."""
     pairs = [(m.lower(), f.lower()) for m, f in _resource("gender_lexicon.json")["pairs"]]
+    return {"male": frozenset(m for m, _ in pairs), "female": frozenset(f for _, f in pairs)}
+
+
+def load_resources():
     return {
-        "male": frozenset(m for m, _ in pairs),
-        "female": frozenset(f for _, f in pairs),
+        **gender_sets(),
         "protected": frozenset(w.lower() for w in _resource("protected_words.json")["words"]),
         "stopwords": frozenset(w.lower() for w in _resource("stopwords.json")["words"]),
         "disability_words": frozenset(w for t in DISABILITY_TERMS for w in t.split()),
@@ -257,7 +286,7 @@ def check_tags(text, axis, group, raw, res):
 class HFGenerator:
     """Greedy chat generation with a Hugging Face causal LM, batched with left padding."""
 
-    def __init__(self, model_name, quantization="auto", batch_size=8, max_new_tokens=384, token=None):
+    def __init__(self, model_name, quantization="auto", batch_size=8, max_new_tokens=384, token=None, verbose=True):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -284,7 +313,7 @@ class HFGenerator:
             self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
         self.model.eval()
         self.batch_size, self.max_new_tokens = batch_size, max_new_tokens
-        self.quantization = quantization
+        self.quantization, self.verbose = quantization, verbose
 
     def _render(self, messages):
         try:  # Qwen3 is a hybrid reasoning model: answer directly, no thinking block
@@ -304,7 +333,8 @@ class HFGenerator:
                 out = self.model.generate(**enc, max_new_tokens=self.max_new_tokens, do_sample=False,
                                           pad_token_id=self.tok.pad_token_id)
             replies += self.tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-            print(f"  tagged {min(i + self.batch_size, len(conversations))}/{len(conversations)}", flush=True)
+            if self.verbose:
+                print(f"  tagged {min(i + self.batch_size, len(conversations))}/{len(conversations)}", flush=True)
         return replies
 
 
@@ -498,6 +528,543 @@ def finalize(args):
     return final, agreement
 
 
+# ---------------------------------------------------------------- twins (training and test counterfactuals)
+
+TWIN_SYSTEM = """You write counterfactual twins of social media posts, for training and testing a toxicity classifier.
+A twin changes the group of the people the post talks about, and nothing else.
+Reply with one JSON object only, no other text."""
+
+TWIN_RULES = {
+    "gender": """Axis: gender. The twin swaps the gender of every person the post talks about.
+- "swaps": EVERY word or phrase that marks the gender of a person in the post (pronouns, nouns, kinship terms,
+  titles, first names, gendered modifiers), each paired with its counterpart of the other gender, so that every
+  man becomes a woman and every woman a man. Surnames stay.
+- Copy each phrase exactly as it appears in the post. One phrase replaces every occurrence of it, so tag longer
+  phrases when a word has two uses: "her" can be possessive (his) or object (him), so tag ["told her", "told him"]
+  and ["her car", "his car"] instead of a bare "her".
+- "group": "male" or "female" if the post talks only about men or only about women, "mixed" if about both.
+- "kept": gender words you leave unchanged because they are not about a person ("Man, that was close",
+  "you guys" said to anyone, "mark my words").
+- "usable": false, with a "reason", when the post has no twin:
+  "no_person": no gender word in the post is about a person;
+  "group_specific": the post only makes sense for one gender (pregnancy, breastfeeding, sex-specific anatomy).""",
+    "disability": """Axis: disability. The twin removes the disability of every disabled person the post talks about.
+- "swaps": EVERY word or phrase that says a person in the post is disabled, each paired with the same phrase
+  without the disability, so that the person is not disabled and nothing else changes: "deaf cousin" -> "cousin",
+  "wheelchair user" -> "person", "the blind" -> "the people", "people with autism" -> "people". Include an article
+  that has to change ("an autistic boy" -> "a boy").
+- Copy each phrase exactly as it appears in the post. One phrase replaces every occurrence of it.
+- "group": "disabled".
+- "kept": disability words you leave unchanged because they are not about a disabled person.
+- "usable": false, with a "reason", when the post has no twin:
+  "no_person": the post names a condition but no person who has it ("autism rates are rising");
+  "figurative": the word is a figure of speech ("blind spot", "turn a blind eye", "deaf to reason");
+  "insult": the word is an insult, not a description of a disabled person ("what a lunatic", "you retard");
+  "group_specific": the rest of the post only makes sense for disabled people (sign language, ramps, braille).""",
+}
+TWIN_KEYS = """JSON keys: "usable" (true/false), "reason" (one of the codes above, only when not usable), "group",
+"swaps" (list of [phrase, replacement]), "kept" (list of words)."""
+TWIN_REASONS = {"gender": ("no_person", "group_specific"),
+                "disability": ("no_person", "figurative", "insult", "group_specific")}
+TWIN_GROUPS = {"gender": ("male", "female", "mixed"), "disability": ("disabled",)}
+
+TWIN_EXAMPLES = {
+    "gender": [
+        ("The new manager, a woman from sales, thinks her ideas are always better than ours.",
+         {"usable": True, "group": "female", "swaps": [["a woman", "a man"], ["her", "his"]], "kept": []}),
+        ("My brother told his wife that he was done, man.",
+         {"usable": True, "group": "mixed",
+          "swaps": [["brother", "sister"], ["his wife", "her husband"], ["he", "she"]], "kept": ["man"]}),
+        ("Man, that was a close game last night.",
+         {"usable": False, "reason": "no_person", "group": "", "swaps": [], "kept": ["Man"]}),
+        ("Women who breastfeed in public should be left alone.",
+         {"usable": False, "reason": "group_specific", "group": "female", "swaps": [], "kept": []}),
+    ],
+    "disability": [
+        ("My deaf cousin keeps texting me about the game tonight.",
+         {"usable": True, "group": "disabled", "swaps": [["deaf cousin", "cousin"]], "kept": []}),
+        ("An autistic boy in my class won the spelling bee.",
+         {"usable": True, "group": "disabled", "swaps": [["An autistic boy", "A boy"]], "kept": []}),
+        ("He has a huge blind spot on trade.",
+         {"usable": False, "reason": "figurative", "group": "", "swaps": [], "kept": ["blind"]}),
+        ("Only a lunatic would vote for this.",
+         {"usable": False, "reason": "insult", "group": "", "swaps": [], "kept": ["lunatic"]}),
+    ],
+}
+
+# More gendered person nouns for the twin checks only. The framework lexicon has 30 pairs and few plurals, so
+# with it alone a correct "boys" -> "girls" swap would look like a changed non-gender word.
+GENDER_EXTRA_PAIRS = (
+    ("boy", "girl"), ("boys", "girls"), ("sons", "daughters"), ("fathers", "mothers"), ("husbands", "wives"),
+    ("brothers", "sisters"), ("uncles", "aunts"), ("nephews", "nieces"), ("kings", "queens"),
+    ("gentlemen", "ladies"), ("males", "females"), ("boyfriends", "girlfriends"), ("grandfathers", "grandmothers"),
+    ("grandson", "granddaughter"), ("grandsons", "granddaughters"), ("grandpa", "grandma"), ("dad", "mom"),
+    ("dads", "moms"), ("dad", "mum"), ("daddy", "mommy"), ("papa", "mama"), ("mr", "mrs"), ("mr", "miss"),
+    ("sir", "madam"), ("lad", "lass"), ("dude", "gal"), ("dudes", "gals"), ("bro", "sis"), ("fiance", "fiancee"),
+    ("widower", "widow"), ("groom", "bride"), ("prince", "princess"), ("duke", "duchess"),
+    ("chairman", "chairwoman"), ("congressman", "congresswoman"), ("spokesman", "spokeswoman"),
+    ("businessman", "businesswoman"), ("businessmen", "businesswomen"), ("policeman", "policewoman"),
+    ("salesman", "saleswoman"),
+)
+# A gender swap must not neutralise: "he" -> "they" is not a twin.
+GENDER_NEUTRAL = frozenset({"they", "them", "their", "theirs", "themselves", "person", "people", "someone",
+                            "somebody", "partner", "partners", "spouse", "spouses", "sibling", "siblings", "parent",
+                            "parents", "child", "children", "kid", "kids", "individual", "folks"})
+# Words a disability removal may add: an article or a plain person noun ("wheelchair user" -> "person").
+DISABILITY_FILLERS = frozenset({"a", "an", "the", "person", "people", "someone", "somebody", "individual",
+                                "individuals", "folks", "one", "ones", "others"})
+_DELETED, _DELETED_CAP = "\x00", "\x01"
+_ARTICLE_RE = re.compile(r"\b(a|an)\s+([A-Za-z]+)", re.I)
+
+
+def twin_resources():
+    lex = gender_sets()
+    return {"male": lex["male"] | {m for m, _ in GENDER_EXTRA_PAIRS},
+            "female": lex["female"] | {f for _, f in GENDER_EXTRA_PAIRS}}
+
+
+def build_twin_messages(text, axis):
+    messages = [{"role": "system", "content": f"{TWIN_SYSTEM}\n\n{TWIN_RULES[axis]}\n{TWIN_KEYS}"}]
+    for ex_text, ex_out in TWIN_EXAMPLES[axis]:
+        messages.append({"role": "user", "content": f"Post: {ex_text}"})
+        messages.append({"role": "assistant", "content": json.dumps(ex_out)})
+    messages.append({"role": "user", "content": f"Post: {text}"})
+    return messages
+
+
+def _norm_phrase(s):
+    return re.sub(r"\s+", " ", s.replace("’", "'")).strip().lower()
+
+
+def _phrase_pattern(phrase):
+    parts = [re.escape(w).replace("'", "['’]") for w in _norm_phrase(phrase).split(" ")]
+    return r"(?<![\w'’])" + r"\s+".join(parts) + r"(?!\w)"
+
+
+def _match_case(found, repl):
+    if not repl:
+        return _DELETED_CAP if found[:1].isupper() else _DELETED
+    if len(found) > 1 and found.isupper():
+        return repl.upper()
+    if found[:1].isupper():
+        return repl[:1].upper() + repl[1:]
+    return repl if repl.isupper() and len(repl) > 1 else repl[:1].lower() + repl[1:]
+
+
+def _close_gaps(text):
+    """Removes the marks an empty replacement left, with one space, and capitalises the next
+    word when a capitalised sentence start was deleted ("Deaf people ..." -> "People ...")."""
+    while True:
+        m = re.search(f"[{_DELETED}{_DELETED_CAP}]", text)
+        if not m:
+            return text
+        before, after = text[:m.start()], text[m.end():]
+        if re.match(r"\s*([.,;:!?)\]]|$)", after):
+            before = before.rstrip()
+        else:
+            after = after.lstrip()
+            if m.group(0) == _DELETED_CAP and (not before.strip() or re.search(r"[.!?]\s*$", before)):
+                after = after[:1].upper() + after[1:]
+        text = before + after
+
+
+def apply_swaps(text, swaps, spans=None):
+    """Applies [phrase, replacement] pairs in one pass, so he -> she and she -> he don't undo
+    each other; where phrases overlap the longest wins. Matches are case-insensitive, at word
+    boundaries ("he" never matches inside "the" or "she"), and a possessive stays attached
+    ("women's" -> "men's"). A replacement takes the case of the text it replaces.
+    Returns (twin text, the phrases that do not occur in the text). A `spans` list, if given,
+    receives the (start, end) of every replaced stretch of `text`."""
+    missing, table = [], {}
+    for phrase, repl in swaps:
+        key = _norm_phrase(phrase)
+        if not key:
+            continue
+        if re.search(_phrase_pattern(phrase), text, re.I):
+            table.setdefault(key, repl)
+        else:
+            missing.append(phrase)
+    if not table:
+        return text, missing
+    pattern = re.compile("|".join(_phrase_pattern(k) for k in sorted(table, key=len, reverse=True)), re.I)
+
+    def replace(m):
+        if spans is not None:
+            spans.append((m.start(), m.end()))
+        return _match_case(m.group(0), table[_norm_phrase(m.group(0))])
+
+    return _close_gaps(pattern.sub(replace, text)), missing
+
+
+def _base(word):
+    return re.sub(r"'[a-z]+$", "", word.lower())  # "she's", "he'd", "women's" -> she, he, women
+
+
+def _genders(text, res):
+    found = set()
+    for w in WORD_RE.findall(text):
+        b = _base(w)
+        found |= {"male"} if b in res["male"] else set()
+        found |= {"female"} if b in res["female"] else set()
+    return found
+
+
+def _other_words(text, markers):
+    """The lowercase words of a swap phrase that are not gender words. Capitalised words are left out:
+    names ("Bill" -> "Jill") and sentence starts ("The man" -> "The woman") may differ."""
+    return Counter(_base(w) for w in WORD_RE.findall(text) if not w[:1].isupper() and _base(w) not in markers)
+
+
+def _bad_articles(text):
+    return {f"{a.lower()} {w.lower()}" for a, w in _ARTICLE_RE.findall(text)
+            if (a.lower() == "a") == (w[:1].lower() in "aeiou")}
+
+
+def check_twin(text, axis, raw, res):
+    """Cleans one LLM twin answer and checks it. Returns a dict with usable (None when the reply
+    did not parse), reason (a TWIN_REASONS code or "other"), reason_text, group, swaps, kept,
+    twin_text, n_changed (word edits), issues, and twin_ok: a usable twin with no issues, the
+    only kind a training run or the transfer test should use."""
+    out = {"usable": None, "reason": "", "reason_text": "", "group": "", "swaps": [], "kept": [],
+           "twin_text": "", "n_changed": 0, "issues": [], "twin_ok": False}
+    issues = out["issues"]
+    if raw is None:
+        issues.append("llm_parse_error")
+        return out
+    group = str(raw.get("group") or "").strip().lower()
+    out["usable"] = not (raw.get("usable") is False or str(raw.get("usable")).strip().lower() == "false")
+    if not out["usable"]:
+        out["reason_text"] = str(raw.get("reason") or "").strip()
+        code = re.sub(r"[\s-]+", "_", out["reason_text"].lower())
+        out["reason"] = code if code in TWIN_REASONS[axis] else "other"
+        out["group"] = group if group in TWIN_GROUPS[axis] else ""
+        return out
+
+    kept = raw.get("kept") or []
+    kept = [kept] if isinstance(kept, str) else [k for k in kept if isinstance(k, str)]
+    post_words = [_base(w) for w in WORD_RE.findall(text)]
+    out["kept"] = [k.strip() for k in kept if k.strip()]
+    kept_words = {_base(w) for k in out["kept"] for w in WORD_RE.findall(k)} & set(post_words)
+
+    swaps, seen = [], set()
+    for pair in raw.get("swaps") or []:
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and all(isinstance(x, str) for x in pair)):
+            issues.append(f"bad_swap_pair: {pair!r}")
+            continue
+        phrase, repl = pair[0].strip(), pair[1].strip()
+        key = _norm_phrase(phrase)
+        if not key or key == _norm_phrase(repl) or key in seen:
+            continue
+        seen.add(key)
+        swaps.append([phrase, repl])
+    spans = []
+    twin, missing = apply_swaps(text, swaps, spans)
+    if missing:
+        issues.append(f"swap_not_in_post: {missing}")
+        swaps = [p for p in swaps if p[0] not in missing]
+    out["swaps"], out["twin_text"] = swaps, twin
+    if not swaps:
+        issues.append("no_swaps")
+    elif twin == text:
+        issues.append("no_change")
+
+    twin_words = [_base(w) for w in WORD_RE.findall(twin)]
+    opcodes = difflib.SequenceMatcher(None, post_words, twin_words, autojunk=False).get_opcodes()
+    out["n_changed"] = sum(max(i2 - i1, j2 - j1) for op, i1, i2, j1, j2 in opcodes if op != "equal")
+    unchanged = [_base(m.group(0)) for m in WORD_RE.finditer(text) if not any(s <= m.start() < e for s, e in spans)]
+
+    if axis == "gender":
+        markers = res["male"] | res["female"]
+        left = sorted({w for w in unchanged if w in markers and w not in kept_words})
+        if left and swaps:
+            issues.append(f"gender_words_left: {left}")
+        swapped_genders = set()
+        for phrase, repl in swaps:
+            gp, gr = _genders(phrase, res), _genders(repl, res)
+            swapped_genders |= gp
+            if gp and not gr and {_base(w) for w in WORD_RE.findall(repl)} <= GENDER_NEUTRAL:
+                issues.append(f"gender_neutral_replacement: {[phrase, repl]}")
+            elif gp and gp == gr and len(gp) == 1:
+                issues.append(f"same_gender: {[phrase, repl]}")
+            if _other_words(phrase, markers) != _other_words(repl, markers):
+                issues.append(f"swap_changes_other_words: {[phrase, repl]}")
+        if group in ("male", "female") and swapped_genders - {group}:
+            issues.append(f"group_mismatch: llm says {group}, swaps change {sorted(swapped_genders)}")
+        if group not in TWIN_GROUPS["gender"]:
+            group = "mixed" if len(swapped_genders) == 2 else next(iter(swapped_genders), "")
+            if not group:
+                issues.append("no_group")
+    else:
+        left = [t for t in disability_hits(twin) if not {_base(w) for w in t.split()} <= kept_words]
+        if left:
+            issues.append(f"disability_terms_left: {left}")
+        for phrase, repl in swaps:
+            if {_base(w) for w in WORD_RE.findall(repl)} - {_base(w) for w in WORD_RE.findall(phrase)} - DISABILITY_FILLERS:
+                issues.append(f"replacement_adds_words: {[phrase, repl]}")
+        group = "disabled"
+    new_articles = _bad_articles(twin) - _bad_articles(text)
+    if new_articles:
+        issues.append(f"article: {sorted(new_articles)}")
+    out["group"] = group
+    out["twin_ok"] = not issues
+    return out
+
+
+def twin_tasks(row, axes=AXES):
+    """The axes to write a twin for: every axis the data notebook's lexicon tagged (gender posts of
+    both genders included: the twin swaps everyone)."""
+    axis = str(row.get("axis") or "")
+    tasks = []
+    if "gender" in axes and (str(row.get("gender_terms") or "").strip() or axis in ("gender", "both")):
+        tasks.append("gender")
+    if "disability" in axes and (str(row.get("disability_terms") or "").strip() or axis in ("disability", "both")):
+        tasks.append("disability")
+    return tasks
+
+
+def _read_ids(path):
+    if str(path).endswith((".csv", ".csv.gz")):
+        import pandas as pd
+        return set(pd.read_csv(path, usecols=["id"], dtype=str, keep_default_na=False)["id"])
+    with open(path, encoding="utf-8") as handle:
+        return {line.strip() for line in handle if line.strip()}
+
+
+def _load_replies(raw_path):
+    replies, models = {}, set()
+    if raw_path.exists():
+        with open(raw_path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:  # a line cut off when the run stopped
+                    continue
+                replies[(str(r["id"]), r["axis"])] = r["reply"]
+                models.add(r.get("model"))
+    return replies, models
+
+
+def _truthy(value):
+    return str(value).strip().lower() in ("true", "1", "yes", "y")
+
+
+def twin_summary(records, axes=AXES):
+    out = {}
+    for axis in axes:
+        rows = [r for r in records if r["axis"] == axis]
+        ok = [r for r in rows if r["twin_ok"]]
+        edits = sorted(r["n_changed"] for r in ok)
+        out[axis] = {
+            "posts": len(rows),
+            "parsed": sum(r["usable"] is not None for r in rows),
+            "usable": sum(r["usable"] is True for r in rows),
+            "twin_ok": len(ok),
+            "twin_ok_share": round(len(ok) / len(rows), 4) if rows else None,
+            "no_twin": dict(Counter(r["reason"] for r in rows if r["usable"] is False).most_common()),
+            "issues": dict(Counter(i.split(":")[0] for r in rows for i in r["issues"]).most_common()),
+            "groups": dict(Counter(r["group"] for r in ok).most_common()),
+            "median_word_edits": edits[len(edits) // 2] if edits else None,
+        }
+    return out
+
+
+TWIN_COLUMNS = ("id", "split", "source", "label", "axis", "group", "usable", "reason", "reason_text", "twin_ok",
+                "issues", "n_changed", "text", "twin_text", "swaps", "kept", "lexicon_terms", "tagger")
+
+
+def twins(args, generate=None):
+    """LLM twins for every post (and axis) the lexicon tagged in `args.input`. Replies are appended to
+    <out>_raw.jsonl as each chunk finishes; a rerun skips posts already answered, so a stopped run
+    resumes. The checks always rerun on every reply, so changing them needs no new LLM calls."""
+    import pandas as pd
+
+    res = twin_resources()
+    frame = pd.read_csv(args.input, keep_default_na=False, dtype={"id": str})
+    if args.ids:
+        keep = _read_ids(args.ids)
+        frame = frame[frame["id"].astype(str).isin(keep)]
+        print(f"--ids: {len(frame)} of {len(keep)} listed posts found in {args.input}")
+    if args.limit:
+        frame = frame.head(args.limit)
+    rows = {str(r["id"]): r for r in frame.to_dict("records")}
+    axes = tuple(args.axes)
+    jobs = [(pid, axis) for pid, row in rows.items() for axis in twin_tasks(row, axes)]
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path = out_path.with_name(out_path.stem + "_raw.jsonl")
+    if args.fresh and raw_path.exists():
+        backup = raw_path.with_name(f"{raw_path.stem}.{time.strftime('%Y%m%d-%H%M%S')}.bak.jsonl")
+        raw_path.rename(backup)
+        print(f"--fresh: moved the saved replies to {backup}")
+    replies, models = _load_replies(raw_path)
+    if models - {args.model}:
+        raise SystemExit(f"{raw_path} holds replies from {sorted(map(str, models))}, not {args.model}. "
+                         "Use --fresh (the old replies are kept as a .bak file) or another --out.")
+    pending = [j for j in jobs if j not in replies]
+    per_axis = Counter(axis for _, axis in jobs)
+    print(f"{len(rows)} posts, {len(jobs)} (post, axis) jobs {dict(per_axis)}; "
+          f"{len(jobs) - len(pending)} already answered, {len(pending)} to tag")
+
+    if pending:
+        if generate is None:
+            import os
+            generate = HFGenerator(args.model, args.quantization, args.batch_size, max_new_tokens=args.max_new_tokens,
+                                   token=os.environ.get("HF_TOKEN") or None, verbose=False)
+        # Longest posts first: similar lengths share a batch (less padding), an out-of-memory batch
+        # fails in the first minutes, and the time estimate starts pessimistic.
+        pending.sort(key=lambda j: len(rows[j[0]]["text"]), reverse=True)
+        if raw_path.exists() and raw_path.stat().st_size:
+            with open(raw_path, "rb") as handle:
+                handle.seek(-1, 2)
+                ends_cleanly = handle.read(1) == b"\n"
+            if not ends_cleanly:
+                with open(raw_path, "a", encoding="utf-8") as handle:
+                    handle.write("\n")
+        start_time, done = time.time(), 0
+        with open(raw_path, "a", encoding="utf-8") as handle:
+            for start in range(0, len(pending), args.chunk_size):
+                chunk = pending[start:start + args.chunk_size]
+                got = generate([build_twin_messages(rows[pid]["text"], axis) for pid, axis in chunk])
+                for (pid, axis), reply in zip(chunk, got):
+                    handle.write(json.dumps({"id": pid, "axis": axis, "model": args.model, "reply": reply},
+                                            ensure_ascii=False) + "\n")
+                    replies[(pid, axis)] = reply
+                handle.flush()
+                done += len(chunk)
+                rate = done / max(time.time() - start_time, 1e-9)
+                print(f"  {done}/{len(pending)} tagged, {rate:.1f}/s, about {(len(pending) - done) / rate / 60:.0f} min left",
+                      flush=True)
+
+    records = []
+    for pid, axis in jobs:
+        row = rows[pid]
+        checked = check_twin(row["text"], axis, parse_reply(replies[(pid, axis)]), res)
+        records.append({
+            "id": pid, "split": row.get("split", ""), "source": row.get("source", ""), "label": row.get("label", ""),
+            "axis": axis, **checked, "text": row["text"],
+            "lexicon_terms": row.get("gender_terms" if axis == "gender" else "disability_terms", ""),
+            "tagger": args.model,
+        })
+    with open(out_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TWIN_COLUMNS)
+        writer.writeheader()
+        for r in records:
+            writer.writerow({**{k: r.get(k, "") for k in TWIN_COLUMNS},
+                             "usable": "" if r["usable"] is None else r["usable"],
+                             "issues": "; ".join(r["issues"]),
+                             "swaps": json.dumps(r["swaps"], ensure_ascii=False),
+                             "kept": json.dumps(r["kept"], ensure_ascii=False)})
+    summary = twin_summary(records, axes)
+    with open(out_path.with_name(out_path.stem + "_summary.json"), "w") as handle:
+        json.dump({"input": str(args.input), "tagger": args.model, "axes": summary}, handle, indent=2)
+    print(f"\nWrote {len(records)} rows to {out_path}")
+    for axis, s in summary.items():
+        if s["posts"]:
+            print(f"  {axis:>10}: {s['twin_ok']}/{s['posts']} posts have a usable twin ({s['twin_ok_share']:.0%}); "
+                  f"no twin: {s['no_twin']}; issues: {s['issues']}")
+    return records, summary
+
+
+def load_twins(path, axes=AXES):
+    """{post id: [(axis, twin text, group), ...]} for the rows with twin_ok, for a training run or the
+    transfer test. In train_lm.build_pairs these take the place of gender_counterfactual() and
+    disability_counterfactual() for the posts they cover; the same random pick between axes and the
+    same skip of posts whose hate is aimed at the group (load_targets) still apply. `group` is the
+    original's group (cf_group): male, female or disabled, or mixed for a gender post about both,
+    which has no direction."""
+    import pandas as pd
+
+    frame = pd.read_csv(path, keep_default_na=False, dtype=str)
+    frame = frame[frame["twin_ok"].map(_truthy) & frame["axis"].isin(list(axes))]
+    out = {}
+    for r in frame.to_dict("records"):
+        out.setdefault(r["id"], []).append((r["axis"], r["twin_text"], r["group"]))
+    return out
+
+
+SHEET_QUESTIONS = ("decision_ok", "twin_ok")
+
+
+def twins_sheet(args):
+    """A review sheet of `args.n` twin rows, half per axis: rows with a usable twin and rows the LLM
+    gave no twin (rows the rule checks dropped are left out: nothing uses them). Two reviewers answer
+    yes/no without looking at each other's columns:
+      decision_ok: is the LLM right to give a twin or not (and is its reason, e.g. no_person, right)?
+      twin_ok:     only where there is a twin: is every group word swapped, nothing else changed,
+                   and does it read naturally?"""
+    import pandas as pd
+
+    frame = pd.read_csv(args.twins, keep_default_na=False, dtype=str)
+    pool = frame[frame["twin_ok"].map(_truthy) | (frame["usable"].str.lower() == "false")]
+    axes = [a for a in AXES if (pool["axis"] == a).any()]
+    parts = []
+    for i, axis in enumerate(axes):
+        sub = pool[pool["axis"] == axis]
+        n = args.n // len(axes) + (1 if i < args.n % len(axes) else 0)
+        parts.append(sub.sample(n=min(n, len(sub)), random_state=args.seed))
+    sheet = pd.concat(parts).sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+    sheet = pd.DataFrame({
+        "id": sheet["id"], "axis": sheet["axis"], "group": sheet["group"],
+        "llm_decision": ["twin" if _truthy(u) else f"no twin: {r}" for u, r in zip(sheet["usable"], sheet["reason"])],
+        "text": sheet["text"], "twin_text": sheet["twin_text"], "swaps": sheet["swaps"],
+        **{f"r{k}_{q}": "" for k in (1, 2) for q in SHEET_QUESTIONS}, "notes": "",
+    })
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    sheet.to_csv(args.out, index=False)
+    print(f"Wrote {len(sheet)} rows to {args.out}: {sheet['axis'].value_counts().to_dict()}, "
+          f"{(sheet['llm_decision'] == 'twin').sum()} with a twin. Reviewers fill r1_* / r2_* with yes or no.")
+    return sheet
+
+
+def _yes_no(value):
+    v = str(value).strip().lower()
+    return "yes" if v in ("yes", "y", "1", "true", "ok") else "no" if v in ("no", "n", "0", "false") else ""
+
+
+def _clean(value):
+    return None if isinstance(value, float) and math.isnan(value) else value
+
+
+def twins_agree(args):
+    """Agreement of the two reviewers on the twins sheet (Cohen's kappa) and the share of rows both
+    judge right, per question, overall and per axis. `no_twin_decision_ok` restricts decision_ok to
+    the rows the LLM gave no twin: how often "not about a person" (or its other reasons) is right."""
+    import pandas as pd
+
+    sheet = pd.read_csv(args.sheet, keep_default_na=False, dtype=str)
+    for k in (1, 2):
+        for q in SHEET_QUESTIONS:
+            sheet[f"r{k}_{q}"] = sheet[f"r{k}_{q}"].map(_yes_no)
+    subsets = {"all": sheet, **{a: sheet[sheet["axis"] == a] for a in AXES}}
+    report = {}
+    for name, sub in subsets.items():
+        no_twin = sub[sub["llm_decision"].str.startswith("no twin")]
+        with_twin = sub[sub["llm_decision"] == "twin"]
+        for label, rows, q in (("decision_ok", sub, "decision_ok"), ("no_twin_decision_ok", no_twin, "decision_ok"),
+                               ("twin_ok", with_twin, "twin_ok")):
+            a, b = f"r1_{q}", f"r2_{q}"
+            agree = pair_agreement(rows, a, b)
+            both = rows[(rows[a] != "") & (rows[b] != "")]
+            report.setdefault(name, {})[label] = {
+                "n": agree["n"], "raw_agreement": _clean(agree["raw"]), "kappa": _clean(agree["kappa"]),
+                "yes_r1": _clean((both[a] == "yes").mean()) if len(both) else None,
+                "yes_r2": _clean((both[b] == "yes").mean()) if len(both) else None,
+                "yes_both": _clean(((both[a] == "yes") & (both[b] == "yes")).mean()) if len(both) else None,
+            }
+    out = Path(args.out) if args.out else Path(args.sheet).with_suffix(".agreement.json")
+    with open(out, "w") as handle:
+        json.dump(report, handle, indent=2)
+    for name, block in report.items():
+        for label, s in block.items():
+            if s["n"]:
+                kappa = "n/a" if s["kappa"] is None else f"{s['kappa']:.2f}"
+                print(f"  {name:>10} {label:>19}: {s['n']} rows, raw {s['raw_agreement']:.2f}, kappa {kappa}, "
+                      f"both say yes {s['yes_both']:.0%}")
+    print(f"Wrote {out}")
+    return report
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="LLM tagging of swaps and control synonyms (see module docstring)")
     sub = p.add_subparsers(dest="command", required=True)
@@ -512,8 +1079,32 @@ def main(argv=None):
     f.add_argument("--review", required=True, help="the review CSV with verdicts filled in")
     f.add_argument("--tagged", required=True, help="tagged_posts.jsonl from `tag`")
     f.add_argument("--out", required=True, help="verified_posts.jsonl")
+    w = sub.add_parser("twins", help="one LLM twin per post and axis, for training (train.csv) or testing (test.csv)")
+    w.add_argument("--input", required=True, help="train.csv, val.csv or test.csv from Content_Moderation.ipynb")
+    w.add_argument("--out", required=True,
+                   help="twins CSV, e.g. twins_train.csv; replies go to <name>_raw.jsonl, counts to <name>_summary.json")
+    w.add_argument("--axes", nargs="+", choices=AXES, default=list(AXES))
+    w.add_argument("--ids", default=None,
+                   help="tag only these posts: a CSV with an id column, or one id per line (e.g. the exact training sample)")
+    w.add_argument("--model", default=DEFAULT_MODEL)
+    w.add_argument("--quantization", choices=("auto", "none", "4bit"), default="auto")
+    w.add_argument("--batch-size", type=int, default=16)
+    w.add_argument("--max-new-tokens", type=int, default=256)
+    w.add_argument("--chunk-size", type=int, default=256,
+                   help="replies are saved after every chunk, so a stopped run resumes where it left off")
+    w.add_argument("--fresh", action="store_true", help="tag everything again (saved replies are kept as a .bak file)")
+    w.add_argument("--limit", type=int, default=None, help="only the first N posts (a quick check)")
+    s = sub.add_parser("twins-sheet", help="a review sheet of twins for two reviewers")
+    s.add_argument("--twins", required=True, help="the twins CSV from `twins` (e.g. twins_test.csv)")
+    s.add_argument("--out", required=True)
+    s.add_argument("--n", type=int, default=100)
+    s.add_argument("--seed", type=int, default=0)
+    a = sub.add_parser("twins-agree", help="reviewer agreement on the filled twins sheet")
+    a.add_argument("--sheet", required=True)
+    a.add_argument("--out", default=None, help="default: <sheet>.agreement.json")
     args = p.parse_args(argv)
-    (tag if args.command == "tag" else finalize)(args)
+    commands = {"tag": tag, "finalize": finalize, "twins": twins, "twins-sheet": twins_sheet, "twins-agree": twins_agree}
+    commands[args.command](args)
 
 
 if __name__ == "__main__":
